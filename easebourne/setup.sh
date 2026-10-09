@@ -71,6 +71,7 @@ if [ "$write_env" = 1 ]; then
   done
   SUPPORT=$(ask "Contact email shown to parents" "gsl@easebournescouts.org.uk")
   OPERATOR=$(ask "Data controller name" "1st Easebourne Scout Group")
+  ORGANISERS=$(ask "Organiser emails allowed to sign in (comma separated)" "glv@easebournescouts.org.uk")
   GATE_USER=$(ask "Leaders' username" "leaders")
   GATE_PASS=$(secret "Leaders' password (min 12 characters)")
   while [ "${#GATE_PASS}" -lt 12 ]; do GATE_PASS=$(secret "Too short. Leaders' password"); done
@@ -100,6 +101,8 @@ NEXT_PUBLIC_SUPPORT_EMAIL=$SUPPORT
 NEXT_PUBLIC_SOURCE_URL=https://github.com/DWOF/opensignup
 NEXT_PUBLIC_GOVERNING_LAW="England and Wales"
 NEXT_PUBLIC_OPERATOR_NAME="$OPERATOR"
+
+ORGANISER_EMAILS="$ORGANISERS"
 
 SITE_ADDRESS=$DOMAIN
 GATE_USER=$GATE_USER

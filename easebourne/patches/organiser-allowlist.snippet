@@ -1,0 +1,14 @@
+      // Easebourne: only addresses in ORGANISER_EMAILS may sign in as organisers.
+      // Blank or unset means anyone may (upstream behaviour). Checked before the
+      // sign-in email is sent and again when the link is used.
+      async signIn({ user }) {
+        const allowed = (process.env.ORGANISER_EMAILS ?? '')
+          .split(',')
+          .map((e) => e.trim().toLowerCase())
+          .filter(Boolean);
+        if (allowed.length === 0) return true;
+        const email = (user?.email ?? '').trim().toLowerCase();
+        if (allowed.includes(email)) return true;
+        log.warn({ emailDomain: extractEmailDomain(email) }, 'sign-in refused: not in ORGANISER_EMAILS');
+        return false;
+      },

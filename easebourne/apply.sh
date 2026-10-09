@@ -63,7 +63,11 @@ sed -i "s/^\(\s*\)OpenSignup$/\1${NAME_SED}/" "src/app/app/(chrome)/layout.tsx"
 sed -i "s/Welcome to OpenSignup/Welcome to ${NAME_SED}/" "src/app/app/(chrome)/page.tsx"
 sed -i "s/title: 'OpenSignup'/title: '${NAME_SED}'/g" "src/app/app/(chrome)/signups/[id]/layout.tsx"
 
-# 5. Check nothing was missed in the files we own.
+# 5. Organiser allowlist (ORGANISER_EMAILS in .env).
+sed -i '/^    callbacks: {$/r easebourne/patches/organiser-allowlist.snippet' src/auth/config.ts
+grep -q 'ORGANISER_EMAILS' src/auth/config.ts || { echo "Allowlist patch did not apply" >&2; exit 1; }
+
+# 6. Check nothing was missed in the files we own.
 left=$(grep -l "#1f6feb\|>OpenSignup<\|Sign in to OpenSignup" \
   "${FILES[@]/%/}" 2>/dev/null || true)
 if [ -n "$left" ]; then
