@@ -1,0 +1,26 @@
+# Caddy: HTTPS in front of OpenSignup, with a password on the organiser side.
+#
+# Parents only ever open sign-up links (/s/...), which stay open. Everything
+# an organiser uses (the home page, sign-in, the dashboard and their APIs)
+# needs the shared leaders' username and password first, so nobody outside
+# the Group can create sign-up sheets on our address or send email from it.
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	@organiser {
+		path / /login /login/* /app /app/* /api/auth/* /api/signups /api/signups/* /api/mcp /api/mcp/* /api/oauth/* /oauth/* /.well-known/*
+	}
+	basic_auth @organiser {
+		{$GATE_USER} {$GATE_HASH}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	reverse_proxy web:3000
+}
