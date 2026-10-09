@@ -30,6 +30,7 @@ FILES=(
   src/email/templates/commitment-confirmation.tsx
   src/email/templates/reminder.tsx
   src/oauth/provider.ts
+  src/components/build-wysiwyg/Editable.tsx
 )
 
 # 1. Back to upstream.
@@ -67,7 +68,13 @@ sed -i "s/title: 'OpenSignup'/title: '${NAME_SED}'/g" "src/app/app/(chrome)/sign
 sed -i '/^    callbacks: {$/r easebourne/patches/organiser-allowlist.snippet' src/auth/config.ts
 grep -q 'ORGANISER_EMAILS' src/auth/config.ts || { echo "Allowlist patch did not apply" >&2; exit 1; }
 
-# 6. Check nothing was missed in the files we own.
+# 6. Show line breaks in the builder's description text (the public page
+#    already does). Upstream collapses them in the read-only view.
+sed -i 's/className={`${className} cursor-text rounded/className={`${className} whitespace-pre-line cursor-text rounded/' \
+  src/components/build-wysiwyg/Editable.tsx
+grep -q 'whitespace-pre-line cursor-text' src/components/build-wysiwyg/Editable.tsx || { echo "Line-break patch did not apply" >&2; exit 1; }
+
+# 7. Check nothing was missed in the files we own.
 left=$(grep -l "#1f6feb\|>OpenSignup<\|Sign in to OpenSignup" \
   "${FILES[@]/%/}" 2>/dev/null || true)
 if [ -n "$left" ]; then
