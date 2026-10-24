@@ -3,12 +3,21 @@
 import { useId } from 'react';
 import { Check, Copy, Hash, Trash2 } from 'lucide-react';
 import { FIELD_TYPE_META, FIELD_VALUE_INPUT_CLASS, FIELD_VALUE_INPUTS } from '../build-shared/fieldTypes';
+import { InlineNote } from '@/components/ui/inline-note';
 import { EnumPicker } from './EnumPicker';
 import type { BuildField, BuildRow } from '../build-shared/useBuildState';
 
 type SlotEditorProps = {
   row: BuildRow;
   fields: BuildField[];
+  /** Spots taken on this slot when the page loaded (`committedBySlot`). */
+  taken: number;
+  /**
+   * Whether the people holding this slot are emailed when its date or time
+   * changes: the signup sends reminders. The change email follows the same
+   * switch (src/jobs/slot-changes.ts).
+   */
+  remindersOn: boolean;
   onCellChange: (fieldRef: string, value: string) => void;
   onCapacity: (capacity: number | null) => void;
   /**
@@ -30,6 +39,8 @@ type SlotEditorProps = {
 export function SlotEditor({
   row,
   fields,
+  taken,
+  remindersOn,
   onCellChange,
   onCapacity,
   onAddEnumOption,
@@ -71,6 +82,14 @@ export function SlotEditor({
           </button>
         </div>
       </div>
+      {taken > 0 && (
+        <InlineNote className="mb-2.5">
+          {signedUpLine(taken)}{' '}
+          {remindersOn
+            ? 'If you change its date or time, we\u2019ll email them to let them know.'
+            : 'Reminders are off, so we won\u2019t email them if you change it.'}
+        </InlineNote>
+      )}
       <div className="grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-2.5">
         {fields.map((f) => {
           const fieldType = f.config.fieldType;
@@ -142,4 +161,10 @@ export function SlotEditor({
       </div>
     </div>
   );
+}
+
+function signedUpLine(taken: number): string {
+  return taken === 1
+    ? '1 person is signed up for this slot.'
+    : `${taken} people are signed up for this slot.`;
 }
