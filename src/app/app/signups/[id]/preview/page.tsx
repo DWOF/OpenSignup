@@ -1,14 +1,9 @@
-import Link from 'next/link';
-import { after } from 'next/server';
 import { getDb } from '@/db/client';
 import { requireOrganizerSession, toActor } from '@/auth/session';
-import type { SignupStatus } from '@/schemas/signups';
 import { getSignupForOrganizer } from '@/services/signups';
-import { recordOrganizerView } from '@/lib/view-tracker';
-import SignupView, {
-  toSignupViewFields,
-  toSignupViewSlots,
-} from '@/app/s/[slug]/signup-view';
+import { trackOrganizerView } from '@/lib/view-tracker';
+import { SignupLoadError } from '@/components/signup/SignupLoadError';
+import SignupView, { toSignupViewProps } from '@/app/s/[slug]/signup-view';
 
 // Plain string so the root template (`%s · <INSTANCE_NAME>`) supplies the
 // instance suffix exactly once.
@@ -20,47 +15,22 @@ export default async function SignupPreviewPage({ params }: PageParams) {
   const { id } = await params;
   const session = await requireOrganizerSession();
   const actor = toActor(session);
-  const result = await getSignupForOrganizer(getDb(), actor, id);
+  const result = await getSignupForOrganizer(getDb(), actor, id, { includeFilled: true });
   if (!result.ok) {
-    return (
-      <div className="rounded-xl border border-surface-sunk bg-white p-8">
-        <p className="text-danger font-medium">{result.error.message}</p>
-        <Link href="/app" className="text-brand text-sm underline">
-          Back to dashboard
-        </Link>
-      </div>
-    );
+    return <SignupLoadError message={result.error.message} />;
   }
   const sig = result.value;
 
-  after(() =>
-    recordOrganizerView({
-      actor: { actorId: session.organizerId, actorType: 'organizer' },
-      signupId: sig.id,
-      workspaceId: sig.workspaceId,
-      eventType: 'signup.previewed',
-    }),
-  );
-
-  const slots = toSignupViewSlots(sig);
-  const fields = toSignupViewFields(sig.fields);
-  const settings = (sig.settings ?? {}) as { groupByFieldRefs?: string[] };
-  const groupByRef = settings.groupByFieldRefs?.[0] ?? null;
+  await trackOrganizerView({
+    actor: { actorId: session.organizerId, actorType: 'organizer' },
+    signupId: sig.id,
+    workspaceId: sig.workspaceId,
+    eventType: 'signup.previewed',
+  });
 
   return (
     <main className="flex min-h-[100svh] flex-col py-8">
-      <SignupView
-        signup={{
-          title: sig.title,
-          description: sig.description,
-          status: sig.status as SignupStatus,
-        }}
-        fields={fields}
-        groupByRef={groupByRef}
-        slots={slots}
-        slug={sig.slug}
-        mode="preview"
-      />
+      <SignupView {...toSignupViewProps(sig, sig.committedBySlot)} mode="preview" />
     </main>
   );
 }

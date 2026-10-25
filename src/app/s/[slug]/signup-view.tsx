@@ -1,10 +1,10 @@
 import Link from 'next/link';
-import { slotTimeOfDay } from '@/lib/reminder-fields';
-import type { SignupStatus } from '@/schemas/signups';
-import type { SlotStatus } from '@/schemas/slots';
-import type { SlotFieldDefinition } from '@/schemas/slot-fields';
+import { willSendReminder } from '@/lib/reminder-eligibility';
+import { shownSignupStatus } from '@/lib/signup-closing';
+import { requiresEmail, sendsReminders, type SignupStatus } from '@/schemas/signups';
 import { Banner } from '@/components/banner';
 import CommitDialog from './commit-dialog';
+import { toSignupViewSlots } from './public-signup';
 import {
   ACTION_SIZING,
   buildMetaSegments,
@@ -22,59 +22,49 @@ import type {
 
 export type { SignupViewField, SignupViewSlot };
 
-interface SourceSlot {
-  id: string;
-  ref: string;
-  values: unknown;
-  slotAt: Date | null;
-  capacity: number | null;
-  status: string;
-}
-
-interface SourceField {
-  ref: string;
-  label: string;
-  fieldType: SlotFieldDefinition['fieldType'];
-}
-
-interface SourceSignup {
-  settings: unknown;
-  fields: SlotFieldDefinition[];
-  slots: readonly SourceSlot[];
+/**
+ * The live page's view of the signup itself. Past its closing time an open
+ * signup takes no sign-ups (`signupShutReason`), so it shows as closed: the
+ * Closed banner, and Closed on every slot.
+ */
+export function toSignupViewSignup(
+  signup: {
+    title: string;
+    description: string | null;
+    status: string;
+    closesAt: Date | null;
+    settings: unknown;
+  },
+  now: number = Date.now(),
+): SignupViewProps['signup'] {
+  return {
+    title: signup.title,
+    description: signup.description,
+    status: shownSignupStatus(signup, now) as SignupStatus,
+    requireEmail: requiresEmail(signup.settings),
+    sendReminders: sendsReminders(signup.settings),
+  };
 }
 
 /**
- * The signup's slots as the page renders them. Needs the signup's settings
- * and full field definitions, not just its slots: whether a slot has a time
- * (`hasTime`) depends on which time field pairs with the reminder date field,
- * and the view's own fields carry neither the reminder ref nor sort orders.
+ * Everything the page needs from a signup as a service loads it, with the
+ * sign-up counts per slot; the live page and the organizer's preview both pass
+ * them, so a preview of a live signup shows the spots left. A field
+ * definition already fits `SignupViewField`, so the fields go as they are.
  */
-export function toSignupViewSlots(
-  signup: SourceSignup,
+export function toSignupViewProps(
+  signup: Parameters<typeof toSignupViewSlots>[0] &
+    Parameters<typeof toSignupViewSignup>[0] & { slug: string },
   committedBySlot?: Record<string, number>,
-): SignupViewSlot[] {
-  const settings = (signup.settings ?? {}) as { reminderFromFieldRef?: string };
-  return signup.slots.map((slot) => {
-    const values = (slot.values as Record<string, unknown>) ?? {};
-    return {
-      id: slot.id,
-      ref: slot.ref,
-      values,
-      slotAt: slot.slotAt ? slot.slotAt.toISOString() : null,
-      hasTime: slot.slotAt !== null && slotTimeOfDay(settings, signup.fields, values) !== null,
-      capacity: slot.capacity,
-      status: slot.status as SlotStatus,
-      committed: committedBySlot?.[slot.id] ?? 0,
-    };
-  });
-}
-
-export function toSignupViewFields(fields: readonly SourceField[]): SignupViewField[] {
-  return fields.map((f) => ({
-    ref: f.ref,
-    label: f.label,
-    fieldType: f.fieldType,
-  }));
+): Pick<SignupViewProps, 'signup' | 'fields' | 'groupByRef' | 'slots' | 'slug'> {
+  const settings = (signup.settings ?? {}) as { groupByFieldRefs?: string[] };
+  return {
+    signup: toSignupViewSignup(signup),
+    fields: signup.fields,
+    groupByRef: settings.groupByFieldRefs?.[0] ?? null,
+    slots: toSignupViewSlots(signup, committedBySlot),
+    slug: signup.slug,
+  };
 }
 
 interface SignupViewProps {
@@ -82,6 +72,12 @@ interface SignupViewProps {
     title: string;
     description: string | null;
     status: SignupStatus;
+    /** Whether the sign-up form asks for the email; true when left out. Only
+     *  the live page's form reads it. */
+    requireEmail?: boolean;
+    /** The signup's `sendReminders` setting; false when left out, so nothing
+     *  promises a reminder. Only the live page's form reads it. */
+    sendReminders?: boolean;
   };
   fields: SignupViewField[];
   groupByRef: string | null;
@@ -113,7 +109,8 @@ function groupSlots(
   groupField: SignupViewField | null,
 ): SlotGroup[] {
   if (!groupField) return [{ key: '__all__', label: '', slots }];
-  const order: string[] = [];
+  // A Map keeps its keys in the order they were first set, so the groups come
+  // out in the order of their first slot.
   const map = new Map<string, SlotGroup>();
   for (const slot of slots) {
     const raw = slot.values[groupField.ref];
@@ -125,14 +122,9 @@ function groupSlots(
       existing.slots.push(slot);
     } else {
       map.set(key, { key, label, slots: [slot] });
-      order.push(key);
     }
   }
-  return order.map((k) => {
-    const g = map.get(k);
-    if (!g) throw new Error(`group ${k} missing`);
-    return g;
-  });
+  return [...map.values()];
 }
 
 function titleFor(
@@ -178,38 +170,47 @@ export function SignupViewBody({
           ? 'This signup is archived and is not visible to participants.'
           : 'This signup is live. The page below shows what visitors see.';
 
+  // Closing only stops new sign-ups: everyone keeps their place and can still
+  // change or cancel it, so a returning participant sees this bar under the
+  // Closed banner too.
+  const signedUpBar = firstOwn ? (
+    <div className="flex items-center justify-between gap-3 rounded-xl border border-surface-sunk bg-success/5 px-4 py-3 text-sm">
+      <span>
+        <span className="font-medium">You&apos;re signed up</span> for{' '}
+        <span className="font-medium text-ink">
+          {ownCount === 1 ? firstOwnTitle : `${ownCount} slots`}
+        </span>
+        .
+      </span>
+      <Link
+        href={firstOwn.editUrl}
+        className="shrink-0 font-medium text-brand hover:underline"
+      >
+        {ownCount === 1 ? 'Edit or cancel' : 'Manage'}
+      </Link>
+    </div>
+  ) : null;
+
   return (
     <>
       {!showStateBanner ? null : isPreview ? (
         <Banner kind="preview" title="Preview" body={previewCopy} />
       ) : effectiveStatus === 'closed' ? (
-        <Banner
-          kind="closed"
-          title="Closed"
-          body="This signup is no longer collecting responses."
-        />
-      ) : firstOwn ? (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-surface-sunk bg-success/5 px-4 py-3 text-sm">
-          <span>
-            <span className="font-medium">You&apos;re signed up</span>
-            {ownCount === 1 ? (
-              <>
-                {' '}for <span className="font-medium text-ink">{firstOwnTitle}</span>.
-              </>
-            ) : (
-              <>
-                {' '}for <span className="font-medium text-ink">{ownCount} slots</span>.
-              </>
-            )}
-          </span>
-          <Link
-            href={firstOwn.editUrl}
-            className="shrink-0 font-medium text-brand hover:underline"
-          >
-            {ownCount === 1 ? 'Edit or cancel' : 'Manage'}
-          </Link>
-        </div>
-      ) : null}
+        <>
+          <Banner
+            kind="closed"
+            title="Closed"
+            body={
+              firstOwn
+                ? `No one new can sign up, but your ${ownCount === 1 ? 'spot is' : 'spots are'} still yours.`
+                : 'This signup is no longer collecting responses.'
+            }
+          />
+          {signedUpBar}
+        </>
+      ) : (
+        signedUpBar
+      )}
 
       <header className="space-y-2">
         {/* On /s/[slug] this title *is* the page heading, so it's an h1. In
@@ -226,19 +227,27 @@ export function SignupViewBody({
         {groups.map((group) => (
           <section key={group.key} className="flex flex-col gap-2.5">
             {groupField ? (
-              <h2 className="px-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-ink-muted">
                 {group.label}
               </h2>
             ) : null}
             <ul className="overflow-hidden rounded-2xl border border-surface-sunk bg-white">
               {group.slots.map((slot, idx) => {
-                const full = slot.capacity !== null && slot.committed >= slot.capacity;
+                // Floored at 0: the organizer can lower a slot's capacity below
+                // its sign-ups.
+                const spotsLeft =
+                  slot.capacity === null ? null : Math.max(0, slot.capacity - slot.committed);
+                const full = spotsLeft === 0;
                 const closed = slot.status !== 'open' || effectiveStatus !== 'open' || full;
                 const title = titleFor(slot, primary);
                 const meta = buildMetaSegments({ fields, slot, primaryRef, groupRef });
                 const own = ownBySlot.get(slot.id) ?? null;
                 const isOwn = own !== null;
-                const count = capacityLabel(slot.committed, slot.capacity);
+                // A closed row says "Closed" (or "Full"), and "2 left" beside it
+                // would offer spots nobody can take.
+                const count = closed
+                  ? { text: '', sr: null }
+                  : capacityLabel(slot.committed, slot.capacity);
                 const actionName = slotAccessibleName(group.label || null, title, meta);
                 return (
                   <li
@@ -279,7 +288,7 @@ export function SignupViewBody({
                         {own ? (
                           <Link
                             href={own.editUrl}
-                            aria-label={`Edit your signup for ${actionName}`}
+                            aria-label={`Edit your spot for ${actionName}`}
                             className={`${ACTION_SIZING} border border-surface-sunk bg-white font-medium transition hover:bg-surface-raised`}
                           >
                             Edit
@@ -311,14 +320,15 @@ export function SignupViewBody({
                             actionName={actionName}
                             slotAt={slot.slotAt}
                             slotHasTime={slot.hasTime}
-                            spotsLeft={
-                              slot.capacity === null
-                                ? null
-                                : Math.max(0, slot.capacity - slot.committed)
-                            }
+                            spotsLeft={spotsLeft}
                             capacity={slot.capacity}
                             signupTitle={signup.title}
                             slug={slug}
+                            requireEmail={signup.requireEmail ?? true}
+                            sendsReminder={willSendReminder({
+                              sendReminders: signup.sendReminders ?? false,
+                              slotAt: slot.slotAt ? new Date(slot.slotAt) : null,
+                            })}
                           />
                         )}
                       </div>

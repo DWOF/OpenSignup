@@ -18,6 +18,19 @@ export const EmailSchema = z
   .transform(normalizeEmail)
   .pipe(z.string().email());
 
-export const NameSchema = z.string().min(1).max(100).transform((v) => v.trim());
+// Trimmed before the min(1) check, like EmailSchema, so a name of only spaces
+// is refused rather than stored blank. max(100) is on the raw string.
+export const NameSchema = z
+  .string()
+  .max(100)
+  .transform((v) => v.trim())
+  .pipe(z.string().min(1, 'name is required'));
+
+/** The top of the int `sort_order` column on slots and slot fields. */
+export const MAX_SORT_ORDER = 2_147_483_647;
+
+// Bounded by the column, so a value past it is invalid_input on sortOrder
+// rather than an out-of-range error from Postgres.
+export const SortOrderSchema = z.number().int().nonnegative().max(MAX_SORT_ORDER);
 
 export const TagsSchema = z.array(z.string().min(1).max(40)).max(20).default([]);

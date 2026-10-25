@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
 import { getDb, type Db } from '@/db/client';
 import { activity } from '@/db/schema/activity';
@@ -11,9 +11,12 @@ import { commitToSlot } from '@/services/commitments';
 import { createSignup, deleteSignup, publishSignup } from '@/services/signups';
 import { addSlot } from '@/services/slots';
 import { commitments } from '@/db/schema/commitments';
+import { participants } from '@/db/schema/participants';
 import { slots } from '@/db/schema/slots';
 import { willSendReminder } from '@/lib/reminder-eligibility';
 import { selectDueReminders } from '@/jobs/reminders';
+import { removeParticipantEmail } from '@/services/testing/participants';
+import { getEmailTransport } from './index';
 import { notifyCommitmentCreated } from './notify';
 
 interface Fixture {
@@ -84,6 +87,7 @@ async function commitOnce(fx: Fixture, title: string) {
   return {
     signupId: created.value.id,
     commitmentId: commit.value.commitment.id,
+    participantId: commit.value.commitment.participantId,
     editToken: commit.value.editToken,
   };
 }
@@ -99,6 +103,42 @@ async function confirmationRows(db: Db, commitmentId: string): Promise<number> {
       ),
     );
   return rows.length;
+}
+
+/**
+ * Commits once with the slot set 20 hours out — far enough ahead that a
+ * reminder is genuinely promiseable — then sends the confirmation and returns
+ * what the receipt itself says, html and text together. `optedOut` records the
+ * participant's "Stop reminders" first, the state #423 is about.
+ */
+async function receiptBody(fx: Fixture, title: string, optedOut: boolean): Promise<string> {
+  const { commitmentId, participantId, editToken } = await commitOnce(fx, title);
+  if (optedOut) {
+    await fx.db
+      .update(participants)
+      .set({ remindersOptedOutAt: new Date() })
+      .where(eq(participants.id, participantId));
+  }
+  const [row] = await fx.db
+    .select({ slotId: commitments.slotId })
+    .from(commitments)
+    .where(eq(commitments.id, commitmentId));
+  if (!row) throw new Error('commitment vanished');
+
+  const createdAt = new Date();
+  const slotAt = new Date(createdAt.getTime() + 20 * 3_600_000);
+  await fx.db.update(commitments).set({ createdAt }).where(eq(commitments.id, commitmentId));
+  await fx.db.update(slots).set({ slotAt }).where(eq(slots.id, row.slotId));
+
+  const send = vi.spyOn(getEmailTransport(), 'send');
+  try {
+    await notifyCommitmentCreated(fx.db, commitmentId, editToken);
+    expect(send).toHaveBeenCalledTimes(1);
+    const mail = send.mock.calls[0]?.[0];
+    return `${mail?.html ?? ''}\n${mail?.text ?? ''}`;
+  } finally {
+    send.mockRestore();
+  }
 }
 
 describe('notifyCommitmentCreated (db)', () => {
@@ -136,10 +176,38 @@ describe('notifyCommitmentCreated (db)', () => {
     expect(await confirmationRows(fx.db, commitmentId)).toBe(0);
   });
 
+  it('sends nothing to a participant without an email', async () => {
+    const { commitmentId, participantId, editToken } = await commitOnce(fx, 'No email given');
+    await removeParticipantEmail(fx.db, participantId);
+    const send = vi.spyOn(getEmailTransport(), 'send');
+    try {
+      await notifyCommitmentCreated(fx.db, commitmentId, editToken);
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      send.mockRestore();
+    }
+    expect(await confirmationRows(fx.db, commitmentId)).toBe(0);
+  });
+
   it('swallows an unknown commitment instead of throwing', async () => {
     await expect(
       notifyCommitmentCreated(fx.db, makeId('com'), 'irrelevant'),
     ).resolves.toBeUndefined();
+  });
+
+  describe('the reminder promise printed in the receipt', () => {
+    // The receipt reads the participant's opt-out straight from the row the
+    // commitment joins, so "Stop reminders" has to silence it: a promise the
+    // dispatcher can never keep is the bug in #423.
+    const PROMISE = /reminder the day before/i;
+
+    it('is in the receipt while the participant has not opted out', async () => {
+      expect(await receiptBody(fx, 'Receipt with promise', false)).toMatch(PROMISE);
+    });
+
+    it('is gone from the receipt once the participant opted out', async () => {
+      expect(await receiptBody(fx, 'Receipt without promise', true)).not.toMatch(PROMISE);
+    });
   });
 
   describe('the reminder it promises', () => {
@@ -153,11 +221,24 @@ describe('notifyCommitmentCreated (db)', () => {
       title: string,
       slotMinutesAfterSignup: number,
       hoursSinceSignup: number,
+      opts: { optedOut?: boolean } = {},
     ): Promise<{ promised: boolean; dispatched: boolean }> {
-      const { commitmentId } = await commitOnce(fx, title);
+      const { commitmentId, participantId } = await commitOnce(fx, title);
+      // Opt out before reading, so `promised` starts from the same row the
+      // receipt reads (`notifyCommitmentCreated` joins the participant).
+      if (opts.optedOut) {
+        await fx.db
+          .update(participants)
+          .set({ remindersOptedOutAt: new Date() })
+          .where(eq(participants.id, participantId));
+      }
       const [row] = await fx.db
-        .select({ slotId: commitments.slotId })
+        .select({
+          slotId: commitments.slotId,
+          remindersOptedOutAt: participants.remindersOptedOutAt,
+        })
         .from(commitments)
+        .innerJoin(participants, eq(participants.id, commitments.participantId))
         .where(eq(commitments.id, commitmentId));
       if (!row) throw new Error('commitment vanished');
 
@@ -168,7 +249,12 @@ describe('notifyCommitmentCreated (db)', () => {
 
       const due = await selectDueReminders(fx.db);
       return {
-        promised: willSendReminder({ sendReminders: true, slotAt, createdAt }),
+        promised: willSendReminder({
+          sendReminders: true,
+          slotAt,
+          createdAt,
+          remindersOptedOutAt: row.remindersOptedOutAt,
+        }),
         dispatched: due.some((d) => d.commitmentId === commitmentId),
       };
     }
@@ -192,6 +278,16 @@ describe('notifyCommitmentCreated (db)', () => {
       const { promised, dispatched } = await agreesWithDispatcher('Slot 20h out', 20 * 60, 2);
       expect(promised).toBe(true);
       expect(dispatched).toBe(true);
+    });
+
+    it('promises none, and the dispatcher sends none, once the participant opted out', async () => {
+      // "Stop reminders" and then a re-sign-up: the participant row keeps the
+      // timestamp, so the promise and the dispatcher have to agree on nothing.
+      const { promised, dispatched } = await agreesWithDispatcher('Opted out', 20 * 60, 2, {
+        optedOut: true,
+      });
+      expect(promised).toBe(false);
+      expect(dispatched).toBe(false);
     });
   });
 });

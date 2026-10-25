@@ -17,7 +17,6 @@ function renderForm(maxQuantity: number | null, initialQuantity = 1) {
       initialNotes=""
       initialQuantity={initialQuantity}
       maxQuantity={maxQuantity}
-      slug="example"
     />,
   );
 }
@@ -25,7 +24,7 @@ function renderForm(maxQuantity: number | null, initialQuantity = 1) {
 describe('<EditForm /> quantity', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
-    router.refresh.mockClear();
+    vi.clearAllMocks();
   });
 
   it('asks for a quantity only when the slot has room for more than one', () => {
@@ -65,7 +64,7 @@ describe('<EditForm /> quantity', () => {
     vi.stubGlobal('fetch', fetchMock);
     renderForm(1);
 
-    fireEvent.change(screen.getByLabelText('Notes'), { target: { value: 'Bringing oranges' } });
+    fireEvent.change(screen.getByLabelText('Notes (optional)'), { target: { value: 'Bringing oranges' } });
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
@@ -142,7 +141,7 @@ describe('<EditForm /> quantity', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(
-      "Sign-ups have closed, so you can't add more spots. Keep the number you have.",
+      "You can't add more spots now. Keep the number you have.",
     );
     expect(alert).not.toHaveTextContent('not accepting commitments');
     expect(router.refresh).not.toHaveBeenCalled();
@@ -164,6 +163,70 @@ describe('<EditForm /> quantity', () => {
       'Sorry, this is no longer available. Reload the page to see what has changed.',
     );
     expect(router.push).not.toHaveBeenCalled();
+  });
+
+  // Reloaded, the page says the spot was cancelled and links back to the
+  // sheet, where the spot shows as free. Sent straight to the sheet, people
+  // had no word that the cancel worked.
+  it('reloads the page in place after a cancel', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ data: {} }) }));
+    vi.stubGlobal('fetch', fetchMock);
+    renderForm(4, 2);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel signup' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Yes, cancel' }));
+
+    await waitFor(() => expect(router.refresh).toHaveBeenCalledOnce());
+    expect(router.push).not.toHaveBeenCalled();
+    // Nothing to press again until the cancelled page replaces this form.
+    expect(screen.getByRole('button', { name: 'Cancelling…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Keep' })).toBeDisabled();
+  });
+
+  // The sign-up was cancelled, or moved, in another tab while this page was
+  // open. The page says which once reloaded, in place of this form.
+  it('reloads the page when a save finds the sign-up cancelled', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      json: async () => ({
+        error: {
+          code: 'conflict',
+          message: 'commitment is not active',
+          details: { status: 'cancelled' },
+        },
+      }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    renderForm(4, 2);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(router.refresh).toHaveBeenCalledOnce());
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    // Nothing to press again, each press spending the rate limit, meanwhile.
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Cancel signup' })).toBeDisabled();
+  });
+
+  // A conflict alone is not a cancelled sign-up.
+  it('shows any other conflict without reloading', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      json: async () => ({
+        error: {
+          code: 'conflict',
+          message: 'commitment is not active',
+          details: { status: 'no_show' },
+        },
+      }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    renderForm(4, 2);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('commitment is not active');
+    expect(router.refresh).not.toHaveBeenCalled();
   });
 
   // The page's refresh after a successful save re-reads the limit, but the form
@@ -194,5 +257,51 @@ describe('<EditForm /> quantity', () => {
     await screen.findByText('Saved.');
     expect(screen.getByText('You can have up to 4 spots on this slot.')).toBeInTheDocument();
     expect(screen.getByLabelText('Spots')).toHaveAttribute('max', '4');
+  });
+  // Offline, or a dropped connection: fetch itself rejects.
+  it('says nothing was saved, and lets the participant try again, when the save never reaches the server', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Promise.reject(new TypeError('Failed to fetch'))));
+    renderForm(4, 2);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "Couldn't reach the server, so your changes weren't saved. Check your connection and try again.",
+    );
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Cancel signup' })).toBeEnabled();
+  });
+
+  // An error page from a proxy, say, rather than the API's JSON.
+  it('says nothing was saved when a refused save has no JSON body', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      json: async () => {
+        throw new SyntaxError('Unexpected token < in JSON');
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    renderForm(4, 2);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "Something went wrong, so your changes weren't saved. Try again.",
+    );
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+  });
+
+  it('says the sign-up was not cancelled when the cancel never reaches the server', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Promise.reject(new TypeError('Failed to fetch'))));
+    renderForm(4, 2);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel signup' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Yes, cancel' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "Couldn't reach the server, so your spot wasn't cancelled. Check your connection and try again.",
+    );
+    expect(screen.getByRole('button', { name: 'Cancel signup' })).toBeEnabled();
+    expect(router.push).not.toHaveBeenCalled();
   });
 });

@@ -41,18 +41,25 @@ export const ACTIVITY_EVENTS = [
   'signup.editor_opened',
   'signup.previewed',
   'signup.viewed',
+  'signup.publish_refused',
+  'signup.link_copied',
+  'magic_compose.failed',
   'slot.created',
   'slot.updated',
   'slot.deleted',
   'slot.reordered',
+  'slot.rescheduled',
+  'slot.change_sent',
   'field.created',
   'field.updated',
+  'field.reordered',
   'field.deleted',
   'participant.created',
   'commitment.created',
   'commitment.confirmation_sent',
   'commitment.updated',
   'commitment.cancelled',
+  'commitment.removed',
   'commitment.swapped',
   'commitment.attempt_failed',
   'commitment.edit_link_followed',
@@ -70,6 +77,3 @@ export const ACTIVITY_EVENTS = [
 ] as const;
 
 export type ActivityEvent = (typeof ACTIVITY_EVENTS)[number];
-
-export type Activity = typeof activity.$inferSelect;
-export type NewActivity = typeof activity.$inferInsert;

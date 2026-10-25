@@ -6,9 +6,9 @@ import { getOrganizerSession } from '@/auth/session';
 import { getEnabledOAuthProviders } from '@/auth/oauth-providers';
 import { getCurrentRequestIp } from '@/auth/request-context';
 import { SiteFooter } from '@/components/site-footer';
+import { FormError } from '@/components/ui/form-error';
 import { getDb } from '@/db/client';
-import { ServiceException } from '@/lib/errors';
-import { RateLimits, consumeRateLimit } from '@/lib/rate-limit';
+import { RateLimits, chargeRateLimit } from '@/lib/rate-limit';
 import { EmailSchema } from '@/schemas/common';
 import { LoginForm, type CodeActionResult, type LoginActionResult } from './login-form';
 import { OAuthButtons } from './oauth-buttons';
@@ -42,15 +42,12 @@ export default async function LoginPage({
     const code = String(formData.get('code') ?? '');
     if (!email.success) return { ok: false, message: 'Request a new link first.' };
     const db = getDb();
-    try {
-      // IP first so one client cannot burn a victim's per-email allowance.
-      await consumeRateLimit(db, RateLimits.loginCodePerIp, (await getCurrentRequestIp()) ?? 'unknown');
-      await consumeRateLimit(db, RateLimits.loginCodePerEmail, email.data);
-    } catch (err) {
-      if (err instanceof ServiceException && err.serviceError.code === 'rate_limited') {
-        return { ok: false, message: 'Too many tries. Wait a few minutes, or click the link in the email.' };
-      }
-      throw err;
+    // IP first so one client cannot burn a victim's per-email allowance.
+    if (
+      (await chargeRateLimit(db, RateLimits.loginCodePerIp, (await getCurrentRequestIp()) ?? 'unknown')) !== null ||
+      (await chargeRateLimit(db, RateLimits.loginCodePerEmail, email.data)) !== null
+    ) {
+      return { ok: false, message: 'Too many tries. Wait a few minutes, or click the link in the email.' };
     }
     const result = await redeemLoginCode(db, { email: email.data, code });
     if (!result.ok) {
@@ -82,11 +79,11 @@ export default async function LoginPage({
         </p>
       </div>
       {params.error ? (
-        <p className="text-danger text-sm" role="alert">
+        <FormError>
           {params.error === 'Verification'
             ? 'That sign-in link is no longer valid. It may have been used already or it may have expired. Request a new one below.'
             : 'Something went wrong. Try again.'}
-        </p>
+        </FormError>
       ) : null}
       <OAuthButtons providers={oauthProviders} callbackUrl={callbackUrl} />
       <LoginForm action={handle} redeem={redeem} callbackUrl={callbackUrl} />

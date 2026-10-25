@@ -2,8 +2,10 @@
 
 import { Plus } from 'lucide-react';
 import { Editable } from './Editable';
+import { EnumPicker } from './EnumPicker';
 import { WysiwygSlot } from './WysiwygSlot';
 import { prettyHeader, emptyHeaderCopy } from './prettyHeader';
+import { FIELD_VALUE_INPUTS } from '../build-shared/fieldTypes';
 import type { UseReorderableResult } from '../build-shared/useReorderable';
 import type { BuildField, BuildRow } from '../build-shared/useBuildState';
 
@@ -24,7 +26,15 @@ type WysiwygGroupProps = {
    */
   displayFields: BuildField[];
   fields: BuildField[];
+  /** Spots taken per slot id; a slot with none is absent. */
+  takenBySlot: Record<string, number>;
+  /** Whether the signup sends reminders, and so emails about a moved slot. */
+  remindersOn: boolean;
   expandedRowId: string | null;
+  /** The row whose editor takes focus when it opens: a copy just made by Duplicate. */
+  focusRowId?: string | null;
+  /** Called once that row's editor has taken focus. */
+  onRowFocused?: () => void;
   onExpandRow: (rowId: string | null) => void;
   onEditCell: (rowId: string, fieldRef: string, value: string) => void;
   onSetCapacity: (rowId: string, capacity: number | null) => void;
@@ -34,6 +44,8 @@ type WysiwygGroupProps = {
   onDeleteRow: (rowId: string) => void;
   onAddSlot: (groupKey: string) => void;
   onRenameGroup: (oldKey: string, newKey: string) => void;
+  /** The last change to this header didn't save, and it is back to its saved value. */
+  renameFailed?: boolean;
   /** Shared drag-reorder bindings for slot rows. */
   reorder?: UseReorderableResult;
 };
@@ -43,7 +55,11 @@ export function WysiwygGroup({
   groupField,
   displayFields,
   fields,
+  takenBySlot,
+  remindersOn,
   expandedRowId,
+  focusRowId = null,
+  onRowFocused,
   onExpandRow,
   onEditCell,
   onSetCapacity,
@@ -52,6 +68,7 @@ export function WysiwygGroup({
   onDeleteRow,
   onAddSlot,
   onRenameGroup,
+  renameFailed = false,
   reorder,
 }: WysiwygGroupProps) {
   const showHeader = groupField !== null;
@@ -66,14 +83,19 @@ export function WysiwygGroup({
     <div>
       {showHeader && groupField && (
         <div className="mb-2 -ml-1.5">
-          <Editable
-            value={group.rawValue}
+          <GroupHeader
+            group={group}
+            groupField={groupField}
             display={display}
-            onChange={(next) => onRenameGroup(group.key, next)}
             placeholder={placeholder}
-            ariaLabel={`Group header \u2014 ${display}`}
-            className="inline-block rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-[0.08em] text-ink-soft"
+            onRenameGroup={onRenameGroup}
+            onAddEnumOption={onAddEnumOption}
           />
+          {renameFailed && (
+            <p role="alert" className="mt-1 ml-1.5 text-[11px] text-danger">
+              That change didn&rsquo;t save, so this heading is back to what it was. Try again.
+            </p>
+          )}
         </div>
       )}
       {/* No overflow-hidden: it cut off a List field's menu at the group's
@@ -84,9 +106,13 @@ export function WysiwygGroup({
           <WysiwygSlot
             key={row.id}
             row={row}
+            taken={takenBySlot[row.id] ?? 0}
+            remindersOn={remindersOn}
             fields={fields}
             displayFields={displayFields}
             expanded={expandedRowId === row.id}
+            focusOnOpen={focusRowId === row.id}
+            {...(onRowFocused ? { onFocused: onRowFocused } : {})}
             onExpand={() => onExpandRow(row.id)}
             onCollapse={() => onExpandRow(null)}
             onEditCell={(ref, v) => onEditCell(row.id, ref, v)}
@@ -111,5 +137,66 @@ export function WysiwygGroup({
         </button>
       </div>
     </div>
+  );
+}
+
+const HEADER_CLASSES =
+  'rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-[0.08em] text-ink-soft';
+
+type GroupHeaderProps = Pick<WysiwygGroupProps, 'group' | 'onRenameGroup' | 'onAddEnumOption'> & {
+  groupField: BuildField;
+  display: string;
+  placeholder: string;
+};
+
+/**
+ * A group's header, edited with the same control as the slot editor's cell for
+ * that field, so it can only be set to a value the server takes: a date picker
+ * for a Date field, the list's choices for a List field, free text otherwise.
+ */
+function GroupHeader({
+  group,
+  groupField,
+  display,
+  placeholder,
+  onRenameGroup,
+  onAddEnumOption,
+}: GroupHeaderProps) {
+  const ariaLabel = `Group header \u2014 ${display}`;
+  const rename = (next: string) => onRenameGroup(group.key, next);
+
+  if (groupField.config.fieldType === 'enum') {
+    return (
+      <EnumPicker
+        triggerClassName={`${HEADER_CLASSES} inline-flex items-center gap-1 hover:bg-brand-soft focus:bg-brand-soft focus:outline-none`}
+        value={group.rawValue}
+        options={groupField.config.choices}
+        placeholder={placeholder}
+        ariaLabel={ariaLabel}
+        onChange={(next) => {
+          if (next !== group.rawValue) rename(next);
+        }}
+        onAddOption={(v) => onAddEnumOption(groupField.id, v)}
+      />
+    );
+  }
+
+  const isDate = groupField.config.fieldType === 'date';
+  return (
+    <Editable
+      value={group.rawValue}
+      display={display}
+      // A date input reports '' until a whole date is typed, so an empty
+      // commit is a half-typed date, not a request to clear the header.
+      onChange={(next) => {
+        if (isDate && next === '') return;
+        rename(next);
+      }}
+      placeholder={placeholder}
+      ariaLabel={ariaLabel}
+      className={`${HEADER_CLASSES} inline-block`}
+      {...(isDate ? { input: FIELD_VALUE_INPUTS.date } : {})}
+      {...(groupField.config.fieldType === 'text' ? { maxLength: groupField.config.maxLength } : {})}
+    />
   );
 }

@@ -1,13 +1,15 @@
 import { NextResponse } from 'next/server';
 import { ZodError } from 'zod';
 import type { LinkObject } from './links';
-import { fromZodError, httpStatusFor, type ServiceError } from './errors';
+import { fromZodError, httpStatusFor, ServiceException, type ServiceError } from './errors';
 import { log } from './log';
 import type { Result } from './result';
 
+export type Links = Record<string, LinkObject | string>;
+
 interface SuccessEnvelope<T> {
   data: T;
-  _links?: Record<string, LinkObject | string>;
+  _links?: Links;
 }
 
 export interface ErrorEnvelope {
@@ -25,7 +27,7 @@ export interface ErrorEnvelope {
 export function ok<T>(
   data: T,
   init: {
-    links?: Record<string, LinkObject | string>;
+    links?: Links;
     status?: number;
     headers?: HeadersInit;
   } = {},
@@ -50,15 +52,25 @@ export function errorEnvelope(error: ServiceError): ErrorEnvelope {
   };
 }
 
-export function fail(error: ServiceError, headers?: HeadersInit): NextResponse {
+/** A rate-limited error that knows its wait also tells the client in `Retry-After`. */
+export function fail(error: ServiceError): NextResponse {
+  const retryAfter = error.code === 'rate_limited' ? error.details?.retryAfterSeconds : undefined;
+  const headers = typeof retryAfter === 'number' ? { 'Retry-After': String(retryAfter) } : undefined;
   return NextResponse.json(errorEnvelope(error), { status: httpStatusFor(error.code), headers });
 }
 
+/** Links that name the created or loaded value can be built from it, and only on success. */
 export function respond<T>(
   result: Result<T, ServiceError>,
-  links?: Record<string, LinkObject | string>,
+  links?: Links | ((value: T) => Links),
 ): NextResponse {
-  return result.ok ? ok(result.value, { links }) : fail(result.error);
+  if (!result.ok) return fail(result.error);
+  return ok(result.value, { links: typeof links === 'function' ? links(result.value) : links });
+}
+
+/** The JSON body, or `{}` when it is missing or malformed; the service's Zod parse judges it. */
+export async function readJson(req: Request): Promise<unknown> {
+  return req.json().catch(() => ({}));
 }
 
 /** Wraps a route handler so any ZodError or thrown ServiceException becomes a proper response. */
@@ -67,14 +79,7 @@ export async function handle(fn: () => Promise<Response>): Promise<Response> {
     return await fn();
   } catch (e) {
     if (e instanceof ZodError) return fail(fromZodError(e));
-    if (e && typeof e === 'object' && 'serviceError' in e) {
-      const se = (e as { serviceError: ServiceError }).serviceError;
-      const headers: HeadersInit | undefined =
-        se.code === 'rate_limited' && typeof se.details?.retryAfterSeconds === 'number'
-          ? { 'Retry-After': String(se.details.retryAfterSeconds) }
-          : undefined;
-      return fail(se, headers);
-    }
+    if (e instanceof ServiceException) return fail(e.serviceError);
     log.error({ err: e }, 'unhandled route error');
     return fail({ code: 'internal', message: 'something went wrong' });
   }

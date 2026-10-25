@@ -1,6 +1,9 @@
 import { redirect } from 'next/navigation';
+import { FormError } from '@/components/ui/form-error';
 import { getDb } from '@/db/client';
+import { unsubscribePath } from '@/lib/links';
 import { previewReminderOptOut } from '@/services/reminder-optout';
+import { SignupStateMessage } from '../state-message';
 
 export const metadata = {
   title: 'Reminder emails',
@@ -37,27 +40,26 @@ export default async function UnsubscribePage({ params, searchParams }: PagePara
     // likely visitor is a real participant whose mail client mangled the link,
     // and a "not found" would tell them nothing useful.
     return (
-      <Shell title="This link is incomplete">
-        <p className="text-sm text-ink-muted">
-          Unsubscribe links only work in full. Open the link straight from your reminder email, or
-          reply to the organizer to ask them to stop.
-        </p>
-      </Shell>
+      <SignupStateMessage
+        title="This link is incomplete"
+        body="Unsubscribe links only work in full. Open the link straight from your reminder email, or reply to the organizer to ask them to stop."
+      />
     );
   }
 
   const result = await previewReminderOptOut(getDb(), participantId, token);
   if (!result.ok) {
     return (
-      <Shell title="This link isn't valid">
-        <p className="text-sm text-ink-muted">
-          It may have been mangled in transit, or the signup may have been deleted. Open the link
-          straight from your reminder email, or reply to the organizer to ask them to stop.
-        </p>
-      </Shell>
+      <SignupStateMessage
+        title="This link isn't valid"
+        body="It may have been mangled in transit, or the signup may have been deleted. Open the link straight from your reminder email, or reply to the organizer to ask them to stop."
+      />
     );
   }
 
+  // `participantEmail` is null only for a participant who gave no email. They
+  // never get a reminder, so never this link, and the copy below just leaves
+  // the address out.
   const target = result.value;
 
   // The slug is decoration — the token alone identifies the participant — so a
@@ -65,9 +67,7 @@ export default async function UnsubscribePage({ params, searchParams }: PagePara
   // participant's email address under an unrelated signup's URL. Send them to
   // the canonical address instead of rendering the misleading one.
   if (slug !== target.signupSlug) {
-    redirect(
-      `/s/${target.signupSlug}/unsubscribe?p=${encodeURIComponent(participantId)}&token=${encodeURIComponent(token)}`,
-    );
+    redirect(unsubscribePath(target.signupSlug, participantId, token));
   }
 
   const credentials = (
@@ -92,21 +92,23 @@ export default async function UnsubscribePage({ params, searchParams }: PagePara
         <p className="text-sm text-ink-muted">
           {done === 'off' ? (
             <>
-              You won&apos;t get any more reminder emails for <strong>{target.signupTitle}</strong>.
-              Your slot is unchanged — if you also want to give it up, open the link in your
+              You won&apos;t get any more reminders for <strong>{target.signupTitle}</strong>, or
+              emails when the organizer changes your slot&apos;s date or time. Your slot is unchanged — if you also want to give it up, open the link in your
               confirmation email and cancel there.
             </>
           ) : (
             <>
-              Reminders for <strong>{target.signupTitle}</strong> are off for{' '}
-              {target.participantEmail}. You won&apos;t get any reminder emails about it.
+              Reminders for <strong>{target.signupTitle}</strong> are off
+              {target.participantEmail ? ` for ${target.participantEmail}` : null}. You won&apos;t
+              get reminders about it, or emails when the organizer changes your slot&apos;s date or
+              time.
             </>
           )}
         </p>
         {/*
-          Reminders are per-participant and the row is reused, so without a way
-          back someone who unsubscribes from this signup in September and signs
-          up again in November silently gets nothing.
+          Reminders are per-participant and the row is reused for the same
+          email, so without a way back someone who unsubscribes from this signup
+          in September and signs up again in November silently gets nothing.
         */}
         <form
           action="/api/public/reminder-optout"
@@ -129,20 +131,21 @@ export default async function UnsubscribePage({ params, searchParams }: PagePara
   return (
     <Shell title={done === 'on' ? 'Reminders turned back on' : 'Stop reminder emails?'}>
       {error ? (
-        <p role="alert" className="rounded-lg bg-danger/10 px-3 py-2 text-sm text-danger">
-          That didn&apos;t work — nothing has changed. Try again below.
-        </p>
+        <FormError>That didn&apos;t work — nothing has changed. Try again below.</FormError>
       ) : null}
       <p className="text-sm text-ink-muted">
         {done === 'on' ? (
           <>
-            You&apos;ll get reminders for <strong>{target.signupTitle}</strong> again at{' '}
-            {target.participantEmail}. You can stop them any time from the link in one.
+            You&apos;ll get reminders for <strong>{target.signupTitle}</strong> again
+            {target.participantEmail ? ` at ${target.participantEmail}` : null}, and emails when your
+            slot&apos;s date or time changes. You can stop them
+            any time from the link in one.
           </>
         ) : (
           <>
-            We&apos;ll stop sending {target.participantEmail} reminders for{' '}
-            <strong>{target.signupTitle}</strong>. This only affects this signup, and your slot
+            We&apos;ll stop sending{target.participantEmail ? ` ${target.participantEmail}` : null}{' '}
+            reminders for <strong>{target.signupTitle}</strong>, and emails when the organizer
+            changes your slot&apos;s date or time. This only affects this signup, and your slot
             stays as it is.
           </>
         )}

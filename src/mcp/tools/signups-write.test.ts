@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { serviceError, ServiceException } from '@/lib/errors';
 import { err, ok } from '@/lib/result';
+import { DESCRIPTION_MAX_LENGTH } from '@/schemas/signups';
 import { connectTestClient } from '../testing/client';
 import { signupRow, unitContext } from '../testing/fixtures';
 import {
@@ -55,7 +56,7 @@ const row = signupRow({
   slug: 'snack-rota',
   title: 'Snack rota',
   description: '',
-  settings: { groupByFieldRefs: ['date'], sendReminders: true, requireEmail: true },
+  settings: { groupByFieldRefs: ['date'], sendReminders: true, allowNotes: true },
 });
 
 /** What the read service hands back for the signup `create_signup` just made. */
@@ -138,7 +139,7 @@ describe('create_signup', () => {
     const client = await connectTestClient(ctx, WRITE_TOOLS);
     const r = await client.callTool({
       name: 'create_signup',
-      arguments: { title: 'x y', fields: [{ ref: 'a', label: 'A', fieldType: 'text' }], slots: [{}] },
+      arguments: { title: 'x y', fields: [{ ref: 'a', label: 'A', fieldType: 'text' }], slots: [{ values: { a: 'x' } }] },
     });
     expect(r.isError).toBeFalsy();
     const body = r.structuredContent as { signup: { id: string }; links: unknown; note: string };
@@ -165,6 +166,24 @@ describe('create_signup', () => {
     expect(body.error.code).toBe('invalid_input');
     expect(body.error.suggestion).toMatch(/date/i);
     expect(body.error.details.dropped).toBeTruthy();
+    expect(svc.createSignup).not.toHaveBeenCalled();
+  });
+
+  // Magic Compose cuts an over-long description down; the tool refuses it, so
+  // the assistant can retry with a shorter one.
+  it('refuses a description over its limit and creates nothing', async () => {
+    const client = await connectTestClient(ctx, WRITE_TOOLS);
+    const r = await client.callTool({
+      name: 'create_signup',
+      arguments: {
+        title: 'Snack rota',
+        description: 'x'.repeat(DESCRIPTION_MAX_LENGTH + 1),
+        fields: [{ ref: 'a', label: 'A', fieldType: 'text' }],
+        slots: [{ values: { a: 'x' } }],
+      },
+    });
+    expect(r.isError).toBe(true);
+    expect((r.structuredContent as { error: { code: string } }).error.code).toBe('invalid_input');
     expect(svc.createSignup).not.toHaveBeenCalled();
   });
 
@@ -214,17 +233,54 @@ describe('update_signup', () => {
       'sig_1',
       { settings: { sendReminders: false, lockoutHoursBeforeSlot: 2 } },
     );
-    // The stored row carries requireEmail, which nothing reads, so it is not shown.
+    // The stored row carries allowNotes, which nothing reads, so it is not shown.
     expect((r.structuredContent as { signup: { settings: unknown } }).signup.settings).toEqual({
       groupByFieldRefs: ['date'],
       sendReminders: false,
     });
   });
 
+  it('offers requireEmail, passes it through and shows it back', async () => {
+    svc.updateSignup.mockResolvedValueOnce(ok({ ...row, settings: { ...row.settings, requireEmail: false } }));
+    const client = await connectTestClient(ctx, WRITE_TOOLS);
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === 'update_signup');
+    const settings = tool?.inputSchema.properties?.settings as { properties?: Record<string, unknown> } | undefined;
+    expect(settings?.properties).toHaveProperty('requireEmail');
+    expect(tool?.description).toContain('settings.requireEmail');
+    expect(tool?.description).not.toContain('make the email address optional');
+
+    const r = await client.callTool({
+      name: 'update_signup',
+      arguments: { signupId: 'sig_1', settings: { requireEmail: false } },
+    });
+    expect(r.isError, JSON.stringify(r.structuredContent)).toBeFalsy();
+    expect(svc.updateSignup).toHaveBeenCalledWith(ctx.db, ctx.actor, 'sig_1', { settings: { requireEmail: false } });
+    expect((r.structuredContent as { signup: { settings: unknown } }).signup.settings).toEqual({
+      groupByFieldRefs: ['date'],
+      sendReminders: true,
+      requireEmail: false,
+    });
+  });
+
+  // A client that fills in advertised defaults would otherwise send
+  // requireEmail: true with any settings change, and make the email required again.
+  it('advertises no default for any setting', async () => {
+    const client = await connectTestClient(ctx, WRITE_TOOLS);
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === 'update_signup');
+    const settings = tool?.inputSchema.properties?.settings as
+      | { properties?: Record<string, Record<string, unknown>> }
+      | undefined;
+    expect(Object.keys(settings?.properties ?? {})).toContain('requireEmail');
+    for (const [key, schema] of Object.entries(settings?.properties ?? {})) {
+      expect(schema, key).not.toHaveProperty('default');
+    }
+  });
+
   // Nothing reads these, so accepting one would report a change participants never see.
   it.each([
     ['maxCommitmentsPerParticipant', 2],
-    ['requireEmail', false],
     ['allowNotes', false],
     ['showWhoSignedUp', false],
     ['confirmationMessage', 'See you there'],
@@ -265,14 +321,17 @@ describe('update_signup', () => {
     );
   });
 
-  it('does not offer the password visibility, which nothing enforces', async () => {
+  it('does not offer visibility, which nothing reads', async () => {
+    svc.updateSignup.mockResolvedValueOnce(ok(row));
     const client = await connectTestClient(ctx, WRITE_TOOLS);
-    const r = await client.callTool({ name: 'update_signup', arguments: { signupId: 'sig_1', visibility: 'password' } });
-    expect((r.structuredContent as { error: { code: string; field?: string } }).error).toMatchObject({
-      code: 'invalid_input',
-      field: 'visibility',
-    });
-    expect(svc.updateSignup).not.toHaveBeenCalled();
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === 'update_signup');
+    expect(tool?.inputSchema.properties).not.toHaveProperty('visibility');
+    expect(tool?.description).not.toContain('visibility');
+    expect(tool?.description).not.toContain('public or unlisted');
+
+    await client.callTool({ name: 'update_signup', arguments: { signupId: 'sig_1', title: 'New', visibility: 'public' } });
+    expect(svc.updateSignup).toHaveBeenCalledWith(ctx.db, ctx.actor, 'sig_1', { title: 'New' });
   });
 });
 

@@ -25,6 +25,9 @@ learn the product.
 
 - The title is the task, in the reader's words: "Let more than one person take
   a slot", not "Capacity". Start it with a verb.
+- In `src/help/articles.ts`, the `summary` is one short sentence for the list
+  on `/help`. The `description` is what search results and link previews show:
+  110 to 160 characters, saying what the page helps with.
 - The first paragraph says what the reader will have when they finish.
 - Then the steps. Then anything they might want to know afterwards.
 - Keep each numbered list to about seven steps. If a task needs more, break it
@@ -59,14 +62,20 @@ Explain each one the first time a page uses it.
 | ------------------ | --------------------------------------------------------- | --------------------------------------- |
 | signup             | the page people sign up on                                | sheet, form, event, list                |
 | slot               | one thing people can sign up for                          | row, item, entry, question              |
-| spot               | one place in a slot; a person can take more than one      | place, seat, space                      |
+| spot               | one place in a slot; a person can take more than one      | place, seat, space, sign-up             |
 | field              | a detail every slot has, like its date                    | column, attribute                       |
 | draft              | a signup that isn't published yet; nobody else can see it | (don't use it for an AI's first go)     |
 | publish            | make the signup open to anyone with the link              | go live, launch, activate               |
 | people who sign up | anyone taking a slot                                      | users, customers, members, participants |
 | your site          | the OpenSignup site the reader is on                      | the instance, the server                |
 
-The box for spots is called **Capacity** on screen. Bold that name when you mean
+Don't call what one person holds a "sign-up": beside "signup" it reads as the
+same word spelt two ways. Say their spot, or say what they did ("they signed
+up"). Write "sign-up" only directly before a noun ("sign-up sheet",
+**Sign-up form**), never on its own. This goes for screens, emails and tool
+descriptions as well as help pages.
+
+The box for spots is called **Spots** on screen. Bold that name when you mean
 the box, and say "spots" everywhere else. The design system allows
 "participants" in the product; help pages say "people who sign up", which is
 plainer.
@@ -148,8 +157,8 @@ follow it once on a real screen, before you open the pull request.
 ## Adding a page
 
 `node .claude/skills/help-pages/scripts/new-article.mjs <slug> "<Title>" "<Summary>"`
-starts the files for steps 1, 2 and 4 and does step 3 for you. The files
-contain TODOs, which fail the checks until the page is finished. AI agents: the `help-pages` skill in `.claude/skills/` covers the
+starts the files for steps 1, 2 and 4 and does step 3 for you, leaving a TODO
+for the page's `description`. The files contain TODOs, which fail the checks until the page is finished. AI agents: the `help-pages` skill in `.claude/skills/` covers the
 whole process, reviews included.
 
 1. Put the page's on-screen names in `src/help/articles/<slug>.ui.ts`.

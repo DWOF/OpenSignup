@@ -2,9 +2,16 @@
 
 import { useId, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { capacityMessage } from '../../capacity-message';
-import { closedMessage } from '../../closed-message';
-import { goneMessage } from '../../gone-message';
+import { FormError, SuccessNotice } from '@/components/ui/form-error';
+import { wasCancelled } from '../../cancelled-message';
+import { errorCopyText, participantErrorCopy } from '../../participant-error';
+import { Field, NotesAndSpots } from '../../participant-fields';
+
+// The request never reached the server (offline, or a dropped connection).
+const SAVE_UNREACHABLE = "Couldn't reach the server, so your changes weren't saved. Check your connection and try again.";
+const CANCEL_UNREACHABLE = "Couldn't reach the server, so your spot wasn't cancelled. Check your connection and try again.";
+// A refusal whose answer isn't ours to read, such as an error page from a proxy.
+const SAVE_UNREADABLE = "Something went wrong, so your changes weren't saved. Try again.";
 
 interface EditFormProps {
   commitmentId: string;
@@ -18,7 +25,6 @@ interface EditFormProps {
    * the quantity field is left out; above 1 it is the field's `max`.
    */
   maxQuantity: number | null;
-  slug: string;
 }
 
 export default function EditForm({
@@ -28,7 +34,6 @@ export default function EditForm({
   initialNotes,
   initialQuantity,
   maxQuantity,
-  slug,
 }: EditFormProps) {
   const router = useRouter();
   const [saving, setSaving] = useState(false);
@@ -62,27 +67,43 @@ export default function EditForm({
       // leaves the quantity exactly as it is.
       ...(quantity === null ? {} : { quantity: Number(quantity) }),
     };
-    const res = await fetch(`/api/commitments/${commitmentId}?token=${encodeURIComponent(token)}`, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const payload = await res.json();
-    if (!res.ok) {
+    let res: Response;
+    try {
+      res = await fetch(`/api/commitments/${commitmentId}?token=${encodeURIComponent(token)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      setMessage({ kind: 'err', text: SAVE_UNREACHABLE });
+      setSaving(false);
+      return;
+    }
+    const payload = await res.json().catch(() => null);
+    if (!res.ok && payload === null) {
+      setMessage({ kind: 'err', text: SAVE_UNREADABLE });
+    } else if (!res.ok) {
+      // Cancelled, or moved to another slot, since this page loaded, most
+      // likely in another tab. Every save would be refused, so reload: the
+      // page then says which in place of this form. `saving` stays on, so
+      // nothing here can be pressed again meanwhile.
+      if (wasCancelled(payload?.error)) {
+        router.refresh();
+        return;
+      }
       // `remaining` here is the most this commitment can hold, not the spots
       // still free, so the copy is the edit page's own.
-      const capacity = capacityMessage(payload?.error, 'change');
-      const copy = capacity ?? closedMessage(payload?.error) ?? goneMessage(payload?.error);
+      const copy = participantErrorCopy(payload?.error, 'change');
       setMessage({
         kind: 'err',
-        text: copy
-          ? [copy.message, copy.suggestion].filter(Boolean).join(' ')
-          : (payload?.error?.message ?? 'save failed'),
+        text: copy ? errorCopyText(copy) : (payload?.error?.message ?? 'save failed'),
       });
       // Someone else took spots since this page loaded, so the line at the
       // top and the field's max take the error's number.
       const remaining = payload?.error?.details?.remaining;
-      if (capacity && typeof remaining === 'number') setReportedMax(remaining);
+      if (payload?.error?.code === 'capacity_full' && typeof remaining === 'number') {
+        setReportedMax(remaining);
+      }
     } else {
       setMessage({ kind: 'ok', text: 'Saved.' });
       // The refresh brings a fresh maxQuantity, but this form stays mounted,
@@ -96,22 +117,31 @@ export default function EditForm({
   async function handleConfirmCancel() {
     setSaving(true);
     setMessage(null);
-    const res = await fetch(`/api/commitments/${commitmentId}?token=${encodeURIComponent(token)}`, {
-      method: 'DELETE',
-    });
-    if (res.ok) {
-      router.push(`/s/${slug}`);
-    } else {
-      const payload = await res.json().catch(() => null);
-      const gone = goneMessage(payload?.error);
-      setMessage({
-        kind: 'err',
-        text: gone
-          ? [gone.message, gone.suggestion].join(' ')
-          : (payload?.error?.message ?? 'cancel failed'),
+    let res: Response;
+    try {
+      res = await fetch(`/api/commitments/${commitmentId}?token=${encodeURIComponent(token)}`, {
+        method: 'DELETE',
       });
+    } catch {
+      setMessage({ kind: 'err', text: CANCEL_UNREACHABLE });
       setConfirmingCancel(false);
+      setSaving(false);
+      return;
     }
+    if (res.ok) {
+      // Reload rather than go back to the sheet, whose banner may name another
+      // sign-up this browser holds: the page then says the spot was cancelled
+      // and links back. `saving` stays on until it does.
+      router.refresh();
+      return;
+    }
+    const payload = await res.json().catch(() => null);
+    const copy = participantErrorCopy(payload?.error, 'change');
+    setMessage({
+      kind: 'err',
+      text: copy ? errorCopyText(copy) : (payload?.error?.message ?? 'cancel failed'),
+    });
+    setConfirmingCancel(false);
     setSaving(false);
   }
 
@@ -122,52 +152,23 @@ export default function EditForm({
           You can have up to {spotsMax} spots on this slot.
         </p>
       ) : null}
-      <label className="block">
-        <span className="mb-1 block text-sm font-medium">Name</span>
-        <input
-          type="text"
-          name="name"
-          required
-          defaultValue={initialName}
-          className="focus:border-brand focus:ring-brand w-full rounded-lg border border-surface-sunk px-4 py-3 focus:outline-none focus:ring-1"
-        />
-      </label>
-      <div className={askQuantity ? 'grid grid-cols-[1fr_auto] gap-3' : undefined}>
-        <label className="block">
-          <span className="mb-1 block text-sm font-medium">Notes</span>
-          <input
-            type="text"
-            name="notes"
-            maxLength={500}
-            defaultValue={initialNotes}
-            className="focus:border-brand focus:ring-brand w-full rounded-lg border border-surface-sunk px-4 py-3 focus:outline-none focus:ring-1"
-          />
-        </label>
-        {askQuantity ? (
-          <label className="block w-20">
-            <span className="mb-1 block text-sm font-medium">Spots</span>
-            <input
-              type="number"
-              name="quantity"
-              required
-              min={1}
-              max={spotsMax ?? undefined}
-              defaultValue={initialQuantity}
-              aria-describedby={showSpotsMax ? spotsMaxId : undefined}
-              className="focus:border-brand focus:ring-brand w-full rounded-lg border border-surface-sunk px-4 py-3 focus:outline-none focus:ring-1"
-            />
-          </label>
-        ) : null}
-      </div>
-      {message ? (
-        <p
-          role={message.kind === 'ok' ? 'status' : 'alert'}
-          className={`rounded-lg px-3 py-2 text-sm ${
-            message.kind === 'ok' ? 'bg-success/10 text-success' : 'bg-danger/10 text-danger'
-          }`}
-        >
-          {message.text}
-        </p>
+      <Field label="Your name" type="text" name="name" required defaultValue={initialName} />
+      <NotesAndSpots
+        notes={{ defaultValue: initialNotes }}
+        spots={
+          askQuantity
+            ? {
+                max: spotsMax ?? undefined,
+                defaultValue: initialQuantity,
+                describedBy: showSpotsMax ? spotsMaxId : undefined,
+              }
+            : undefined
+        }
+      />
+      {message?.kind === 'ok' ? (
+        <SuccessNotice>{message.text}</SuccessNotice>
+      ) : message ? (
+        <FormError>{message.text}</FormError>
       ) : null}
       <div className="flex flex-wrap items-center gap-3">
         {confirmingCancel ? (

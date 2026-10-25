@@ -1,17 +1,17 @@
 import { z } from 'zod';
+import { SortOrderSchema } from './common';
 
 const SLOT_STATUSES = ['open', 'closed'] as const;
 export type SlotStatus = (typeof SLOT_STATUSES)[number];
 
 const SlotValuesSchema = z.record(z.string(), z.unknown());
 
-const baseSlotInput = z.object({
+export const SlotCreateInputSchema = z.object({
   values: SlotValuesSchema.default({}),
   capacity: z.number().int().positive().nullable().default(1),
-  sortOrder: z.number().int().nonnegative().optional(),
+  sortOrder: SortOrderSchema.optional(),
 });
 
-export const SlotCreateInputSchema = baseSlotInput;
 export type SlotCreateInput = z.infer<typeof SlotCreateInputSchema>;
 
 export const SlotBulkInputSchema = z.object({
@@ -20,7 +20,7 @@ export const SlotBulkInputSchema = z.object({
       z.object({
         values: SlotValuesSchema.default({}),
         capacity: z.number().int().positive().nullable().optional(),
-        sortOrder: z.number().int().nonnegative().optional(),
+        sortOrder: SortOrderSchema.optional(),
       }),
     )
     .min(1)
@@ -42,7 +42,7 @@ export const SlotUpdateInputSchema = z
   .object({
     values: SlotValuesSchema.optional(),
     capacity: z.number().int().positive().nullable().optional(),
-    sortOrder: z.number().int().nonnegative().optional(),
+    sortOrder: SortOrderSchema.optional(),
     status: z.enum(SLOT_STATUSES).optional(),
   })
   .strict();

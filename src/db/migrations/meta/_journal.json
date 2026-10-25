@@ -78,6 +78,20 @@
       "when": 1791071285775,
       "tag": "0010_clear_pre_1900_slot_times",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1791125357849,
+      "tag": "0011_participant_email_optional",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1791670592037,
+      "tag": "0012_commitment_idempotency_key",
+      "breakpoints": true
     }
   ]
 }

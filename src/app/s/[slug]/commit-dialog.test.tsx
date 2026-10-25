@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import CommitDialog from './commit-dialog';
 import { ACTION_SIZING } from './slot-format';
+import { urlBreakSegments } from './url-breaks';
 
 // The row-level tests all run in `mode="preview"`, which renders a *disabled*
 // stand-in button. This file covers the real trigger — the only button a
@@ -24,6 +25,8 @@ describe('<CommitDialog /> trigger', () => {
         capacity={null}
         signupTitle="Snack duty"
         slug="example"
+        requireEmail
+        sendsReminder={false}
       />,
     );
   }
@@ -55,18 +58,29 @@ describe('<CommitDialog /> sheet', () => {
   function openSheet({
     spotsLeft = null,
     capacity = null,
-  }: { spotsLeft?: number | null; capacity?: number | null } = {}) {
+    requireEmail = true,
+    slotAt = null,
+    sendsReminder = false,
+  }: {
+    spotsLeft?: number | null;
+    capacity?: number | null;
+    requireEmail?: boolean;
+    slotAt?: string | null;
+    sendsReminder?: boolean;
+  } = {}) {
     render(
       <CommitDialog
         slotId="slot_1"
         slotTitle="Cookies"
         actionName="Sat, May 16, Cookies, Vinland Elementary"
-        slotAt={null}
+        slotAt={slotAt}
         slotHasTime={false}
         spotsLeft={spotsLeft}
         capacity={capacity}
         signupTitle="Snack duty"
         slug="example"
+        requireEmail={requireEmail}
+        sendsReminder={sendsReminder}
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: /^Sign up for / }));
@@ -125,6 +139,7 @@ describe('<CommitDialog /> sheet', () => {
 
     await waitFor(() => expect(screen.getByLabelText('Email')).toHaveFocus(), settle);
     expect(screen.getByLabelText('Your name')).toHaveValue('Jordan Fields');
+    expect(screen.getByLabelText('Email')).toHaveValue('jordan@example.test');
   });
 
   // Backdrop tap, Escape and the close X all route through one `onClose`, so
@@ -146,7 +161,10 @@ describe('<CommitDialog /> sheet', () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce(), settle);
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Signing up…' })).toBeDisabled(), settle);
+    await waitFor(
+      () => expect(screen.getByRole('button', { name: 'Signing up…' })).toBeDisabled(),
+      settle,
+    );
     expect(screen.getByRole('dialog')).toBeInTheDocument();
 
     release({
@@ -254,13 +272,126 @@ describe('<CommitDialog /> sheet', () => {
       openSheet();
       await screen.findByLabelText('Your name', {}, settle);
       fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Jordan Fields' } });
-      fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'jordan@example.test' } });
+      fireEvent.change(screen.getByLabelText('Email'), {
+        target: { value: 'jordan@example.test' },
+      });
       fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
 
       const alert = await screen.findByRole('alert', {}, settle);
       expect(alert).toHaveTextContent('Sorry, this is no longer available.');
       expect(alert).toHaveTextContent('Reload the page to see what has changed.');
       expect(alert).not.toHaveTextContent('signup not found');
+      // The ref reaches the alert itself, so a short sheet scrolls to it.
+      await waitFor(() =>
+        expect(vi.mocked(Element.prototype.scrollIntoView).mock.contexts).toContain(alert),
+      );
+    } finally {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // The signup's closing time passed, or the organizer closed it, after this
+  // page loaded.
+  it('says sign-ups have closed in plain words, not the server text', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: { code: 'closed', message: 'signup has closed' } }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    // jsdom leaves scrollIntoView out, and the dialog calls it on the alert.
+    Element.prototype.scrollIntoView = vi.fn();
+    try {
+      openSheet();
+      await screen.findByLabelText('Your name', {}, settle);
+      fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Jordan Fields' } });
+      fireEvent.change(screen.getByLabelText('Email'), {
+        target: { value: 'jordan@example.test' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+
+      const alert = await screen.findByRole('alert', {}, settle);
+      expect(alert).toHaveTextContent('No one new can sign up for this slot now.');
+      expect(alert).toHaveTextContent('Reload the page to see what’s still open.');
+      expect(alert).not.toHaveTextContent('signup has closed');
+    } finally {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // The same email signed up for this slot before, on another device or with
+  // other details.
+  it('says they are already signed up, without a link to that sign-up', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        error: {
+          code: 'conflict',
+          message: 'you already committed to this slot',
+          suggestion: 'edit or cancel your existing commitment',
+          details: { commitmentId: 'com_existing' },
+        },
+      }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    // jsdom leaves scrollIntoView out, and the dialog calls it on the alert.
+    Element.prototype.scrollIntoView = vi.fn();
+    try {
+      openSheet();
+      await screen.findByLabelText('Your name', {}, settle);
+      fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Jordan Fields' } });
+      fireEvent.change(screen.getByLabelText('Email'), {
+        target: { value: 'jordan@example.test' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+
+      const alert = await screen.findByRole('alert', {}, settle);
+      expect(alert).toHaveTextContent("You're already signed up for this slot.");
+      expect(alert).toHaveTextContent(
+        'Use the link in your confirmation email to change or cancel.',
+      );
+      expect(alert).not.toHaveTextContent('you already committed');
+      expect(within(alert).queryByRole('link')).toBeNull();
+    } finally {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // A busy shared network, or the same address trying again and again.
+  it('says how long to wait in minutes when rate limited, not seconds', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 429,
+      json: async () => ({
+        error: {
+          code: 'rate_limited',
+          message: 'too many requests',
+          suggestion: 'wait 3412s and retry',
+          details: { retryAfterSeconds: 3412, bucket: 'commit.email' },
+        },
+      }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    // jsdom leaves scrollIntoView out, and the dialog calls it on the alert.
+    Element.prototype.scrollIntoView = vi.fn();
+    try {
+      openSheet();
+      await screen.findByLabelText('Your name', {}, settle);
+      fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Jordan Fields' } });
+      fireEvent.change(screen.getByLabelText('Email'), {
+        target: { value: 'jordan@example.test' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+
+      const alert = await screen.findByRole('alert', {}, settle);
+      expect(alert).toHaveTextContent('Too many tries just now.');
+      expect(alert).toHaveTextContent('Try again in about 57 minutes.');
+      expect(alert).not.toHaveTextContent('too many requests');
+      expect(alert).not.toHaveTextContent('3412');
     } finally {
       delete (Element.prototype as Partial<Element>).scrollIntoView;
       vi.unstubAllGlobals();
@@ -287,6 +418,202 @@ describe('<CommitDialog /> sheet', () => {
     expect(JSON.parse(String(init.body))).toMatchObject({ quantity: 1 });
 
     vi.unstubAllGlobals();
+  });
+
+  it('requires the email unless the signup makes it optional', async () => {
+    openSheet();
+    expect(await screen.findByLabelText('Email', {}, settle)).toBeRequired();
+    expect(screen.queryByText(/We'll email you your link/)).not.toBeInTheDocument();
+    cleanup();
+
+    openSheet({ requireEmail: false });
+    const email = await screen.findByLabelText('Email (optional)', {}, settle);
+    expect(email).not.toBeRequired();
+    // The label already says it is optional; the help says what it is for.
+    expect(email).toHaveAccessibleDescription(
+      "We'll email you your link to change or cancel. Without an email, save the link we show you after you sign up.",
+    );
+  });
+
+  it('promises a reminder only where the slot will get one', async () => {
+    openSheet({ requireEmail: false, sendsReminder: true });
+    expect(
+      await screen.findByLabelText('Email (optional)', {}, settle),
+    ).toHaveAccessibleDescription(
+      "We'll email you your link to change or cancel, and a reminder before your slot. Without an email, save the link we show you after you sign up.",
+    );
+  });
+
+  it('still suggests a fix for a mistyped email when it is optional', async () => {
+    openSheet({ requireEmail: false });
+    const email = await screen.findByLabelText('Email (optional)', {}, settle);
+    fireEvent.change(email, { target: { value: 'pat@gmial.com' } });
+    fireEvent.click(await screen.findByRole('button', { name: 'pat@gmail.com' }, settle));
+    expect(email).toHaveValue('pat@gmail.com');
+  });
+
+  describe('where the email is optional', () => {
+    const editUrl = 'https://example.test/s/example/c/com_1';
+
+    async function signUpWithEmail(email: string, opts: { slotAt?: string | null } = {}) {
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ data: { commitment: { id: 'com_1' }, editUrl } }),
+      }));
+      vi.stubGlobal('fetch', fetchMock);
+      openSheet({ requireEmail: false, ...opts });
+      await screen.findByLabelText('Your name', {}, settle);
+      fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Jordan Fields' } });
+      fireEvent.change(screen.getByLabelText('Email (optional)'), { target: { value: email } });
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+      await screen.findByRole('heading', { name: "You're in." }, settle);
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)) as Record<string, unknown>;
+    }
+
+    // jsdom has no clipboard.
+    function stubClipboard(writeText: (text: string) => Promise<void>) {
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    }
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      delete (navigator as { clipboard?: unknown }).clipboard;
+    });
+
+    it('sends no email when the box is blank, and says the link will not be emailed', async () => {
+      const body = await signUpWithEmail('  ');
+      expect(body).not.toHaveProperty('email');
+      expect(
+        screen.getByText(
+          "Save this link now: we won't email it, and only this browser remembers it.",
+        ),
+      ).toBeInTheDocument();
+      // Wraps only at <wbr> points, not mid-word, and still reads as the URL.
+      // Found by href: jsdom's name computation pads each <wbr> with a space.
+      const link = screen.getAllByRole('link').find((a) => a.getAttribute('href') === editUrl);
+      expect(link?.textContent).toBe(editUrl);
+      expect(link).toHaveClass('break-words');
+      expect(link).not.toHaveClass('break-all');
+      expect(link!.querySelectorAll('wbr')).toHaveLength(urlBreakSegments(editUrl).length - 1);
+      // No slot date, so no calendar button to mention.
+      expect(screen.queryByText(/Add to calendar/)).not.toBeInTheDocument();
+    });
+
+    it('says Add to calendar saves the link when that button is there', async () => {
+      await signUpWithEmail('', { slotAt: '2030-04-06T12:00:00.000Z' });
+      expect(screen.getByText(/Add to calendar saves the link too\./)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Add to calendar' })).toBeInTheDocument();
+    });
+
+    // The link is how they change or cancel, so nothing offers to post it.
+    it('offers Copy link, not Share link, and says when it copied', async () => {
+      const writeText = vi.fn(async () => {});
+      stubClipboard(writeText);
+      await signUpWithEmail('', { slotAt: '2030-04-06T12:00:00.000Z' });
+      expect(screen.queryByRole('button', { name: 'Share link' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Add to calendar' })).toBeInTheDocument();
+      const status = screen.getByRole('status');
+      expect(status).toBeEmptyDOMElement();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Copy link' }));
+      await waitFor(() => expect(status).toHaveTextContent('Link copied.'), settle);
+      expect(writeText).toHaveBeenCalledWith(editUrl);
+      // Said on the button that did it, not on a line under Add to calendar.
+      // The status stays for screen readers but is hidden on screen.
+      expect(screen.getByRole('button', { name: 'Link copied' })).toBeInTheDocument();
+      expect(status).toHaveClass('sr-only');
+    });
+
+    it('says to copy the link by hand when the browser will not', async () => {
+      const writeText = vi.fn(async () => {
+        throw new Error('not allowed');
+      });
+      stubClipboard(writeText);
+      await signUpWithEmail('');
+      fireEvent.click(screen.getByRole('button', { name: 'Copy link' }));
+      await waitFor(
+        () =>
+          expect(screen.getByRole('status')).toHaveTextContent(
+            "Couldn't copy it. Select the link above and copy it yourself.",
+          ),
+        settle,
+      );
+      // This one says what to do next, so it shows on screen.
+      expect(screen.getByRole('status')).not.toHaveClass('sr-only');
+      expect(screen.getByRole('button', { name: 'Copy link' })).toBeInTheDocument();
+    });
+
+    it('reads as usual when they give an email after all', async () => {
+      const body = await signUpWithEmail('jordan@example.test');
+      expect(body).toMatchObject({ email: 'jordan@example.test' });
+      expect(screen.getByText(/Bookmark this link to edit or cancel later/)).toBeInTheDocument();
+      expect(screen.queryByText(/we won't email it/)).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Share link' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Copy link' })).not.toBeInTheDocument();
+    });
+
+    // Someone who chose to leave it out once should not send it by accident.
+    it('fills in a remembered name but not a remembered email', async () => {
+      window.localStorage.setItem(
+        'opensignup:lastCommit',
+        JSON.stringify({ name: 'Jordan Fields', email: 'jordan@example.test' }),
+      );
+      openSheet({ requireEmail: false });
+      expect(await screen.findByLabelText('Your name', {}, settle)).toHaveValue('Jordan Fields');
+      expect(screen.getByLabelText('Email (optional)')).toHaveValue('');
+    });
+
+    it('keeps the remembered email after a sign-up without one', async () => {
+      window.localStorage.setItem(
+        'opensignup:lastCommit',
+        JSON.stringify({ name: 'Jordan', email: 'jordan@example.test' }),
+      );
+      await signUpWithEmail('');
+      expect(JSON.parse(window.localStorage.getItem('opensignup:lastCommit') ?? 'null')).toEqual({
+        name: 'Jordan Fields',
+        email: 'jordan@example.test',
+      });
+    });
+
+    // The organizer made it required again after the page rendered.
+    it('makes the box required when the server refuses a blank email', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => ({
+          ok: false,
+          status: 400,
+          json: async () => ({
+            error: {
+              code: 'invalid_input',
+              message: 'Email is required for this signup.',
+              field: 'email',
+              suggestion: 'Add your email and try again.',
+            },
+          }),
+        })),
+      );
+      // jsdom leaves scrollIntoView out, and the dialog calls it on the alert.
+      Element.prototype.scrollIntoView = vi.fn();
+      try {
+        openSheet({ requireEmail: false });
+        await screen.findByLabelText('Your name', {}, settle);
+        fireEvent.change(screen.getByLabelText('Your name'), {
+          target: { value: 'Jordan Fields' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+
+        const alert = await screen.findByRole('alert', {}, settle);
+        expect(alert).toHaveTextContent('Email is required for this signup.');
+        const email = screen.getByLabelText('Email');
+        expect(email).toBeRequired();
+        expect(email).not.toHaveAccessibleDescription();
+        expect(screen.queryByLabelText('Email (optional)')).not.toBeInTheDocument();
+        expect(screen.queryByText(/We'll email you your link/)).not.toBeInTheDocument();
+      } finally {
+        delete (Element.prototype as Partial<Element>).scrollIntoView;
+      }
+    });
   });
 
   // The service's own text for this is developer shorthand; the participant
@@ -339,5 +666,154 @@ describe('<CommitDialog /> sheet', () => {
       delete (Element.prototype as Partial<Element>).scrollIntoView;
       vi.unstubAllGlobals();
     }
+  });
+
+  // A phone that loses its connection after the POST got through shows
+  // "network error" for a sign-up the server did make. Pressing Confirm again
+  // must be recognisably the same sign-up, so the server hands that one back
+  // rather than booking a second place (#387).
+  describe('the idempotency key', () => {
+    const success = {
+      ok: true,
+      json: async () => ({
+        data: { commitment: { id: 'com_1' }, editUrl: 'https://example.test/s/example/c/com_1' },
+      }),
+    };
+
+    beforeEach(() => {
+      // jsdom leaves scrollIntoView out, and the dialog calls it on the alert.
+      Element.prototype.scrollIntoView = vi.fn();
+    });
+
+    afterEach(() => {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+      vi.unstubAllGlobals();
+    });
+
+    function sentBodies(fetchMock: ReturnType<typeof vi.fn>) {
+      return fetchMock.mock.calls.map(
+        ([, init]) => JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>,
+      );
+    }
+
+    async function fillAndConfirm(details: { notes?: string } = {}) {
+      await screen.findByLabelText('Your name', {}, settle);
+      fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Example' } });
+      fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'sam@example.test' } });
+      if (details.notes !== undefined) {
+        fireEvent.change(screen.getByLabelText('Notes (optional)'), {
+          target: { value: details.notes },
+        });
+      }
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    }
+
+    async function seeNetworkError() {
+      expect(await screen.findByRole('alert', {}, settle)).toHaveTextContent('network error');
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Confirm' })).toBeEnabled());
+    }
+
+    it('sends an unguessable, URL-safe key with the sign-up', async () => {
+      const fetchMock = vi.fn(async () => success);
+      vi.stubGlobal('fetch', fetchMock);
+
+      openSheet();
+      await fillAndConfirm();
+      await screen.findByRole('heading', { name: "You're in." }, settle);
+
+      const [body] = sentBodies(fetchMock);
+      // What CommitmentCreateInputSchema accepts: 16 to 128 of [A-Za-z0-9_-].
+      expect(body?.idempotencyKey).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+    });
+
+    it('sends the same key when Confirm is pressed again after a network error', async () => {
+      const fetchMock = vi
+        .fn()
+        .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+        .mockResolvedValueOnce(success);
+      vi.stubGlobal('fetch', fetchMock);
+
+      openSheet();
+      await fillAndConfirm();
+      await seeNetworkError();
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+      await screen.findByRole('heading', { name: "You're in." }, settle);
+
+      const [first, second] = sentBodies(fetchMock);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(first?.idempotencyKey).toEqual(expect.any(String));
+      // The same sign-up, key and all.
+      expect(second).toEqual(first);
+    });
+
+    it('sends a new key when the details change before Confirm is pressed again', async () => {
+      const fetchMock = vi
+        .fn()
+        .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+        .mockResolvedValueOnce(success);
+      vi.stubGlobal('fetch', fetchMock);
+
+      openSheet();
+      await fillAndConfirm();
+      await seeNetworkError();
+      fireEvent.change(screen.getByLabelText('Notes (optional)'), {
+        target: { value: 'Bringing a ladder' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+      await screen.findByRole('heading', { name: "You're in." }, settle);
+
+      const [first, second] = sentBodies(fetchMock);
+      expect(second).toMatchObject({ notes: 'Bringing a ladder' });
+      expect(second?.idempotencyKey).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+      expect(second?.idempotencyKey).not.toBe(first?.idempotencyKey);
+    });
+
+    // The row still says Sign up after an error, so opening the sheet again
+    // is another way of trying again.
+    it('keeps the key when the sheet is closed after a network error and opened again', async () => {
+      const fetchMock = vi
+        .fn()
+        .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+        .mockResolvedValueOnce(success);
+      vi.stubGlobal('fetch', fetchMock);
+
+      openSheet();
+      await fillAndConfirm();
+      await seeNetworkError();
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument(), settle);
+
+      fireEvent.click(screen.getByRole('button', { name: /^Sign up for / }));
+      await fillAndConfirm();
+      await screen.findByRole('heading', { name: "You're in." }, settle);
+
+      const [first, second] = sentBodies(fetchMock);
+      expect(first?.idempotencyKey).toEqual(expect.any(String));
+      expect(second).toEqual(first);
+    });
+
+    it('sends a new key for the next sign-up once one has gone through', async () => {
+      const fetchMock = vi.fn(async () => success);
+      vi.stubGlobal('fetch', fetchMock);
+
+      openSheet();
+      await fillAndConfirm();
+      await screen.findByRole('heading', { name: "You're in." }, settle);
+      fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument(), settle);
+
+      // Word for word what the first sent: only the sign-up in between tells
+      // them apart.
+      fireEvent.click(screen.getByRole('button', { name: /^Sign up for / }));
+      await fillAndConfirm();
+      await screen.findByRole('heading', { name: "You're in." }, settle);
+
+      const [first, second] = sentBodies(fetchMock);
+      const { idempotencyKey: firstKey, ...firstRest } = first ?? {};
+      const { idempotencyKey: secondKey, ...secondRest } = second ?? {};
+      expect(secondRest).toEqual(firstRest);
+      expect(secondKey).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+      expect(secondKey).not.toBe(firstKey);
+    });
   });
 });

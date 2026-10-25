@@ -1,35 +1,33 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Plus } from 'lucide-react';
-import { useBuildState, type BuildField, type BuildRow } from '../build-shared/useBuildState';
+import { useBuildState, type BuildField, type BuildRow, type BuildSlot } from '../build-shared/useBuildState';
 import { useReorderable } from '../build-shared/useReorderable';
 import { Editable } from './Editable';
 import { EditingRail } from './EditingRail';
 import { FieldsPopover } from './FieldsPopover';
 import { WysiwygGroup, type SlotGroup } from './WysiwygGroup';
 import type { SlotFieldDefinition } from '@/schemas/slot-fields';
-import type { SignupSettings, SignupStatus } from '@/schemas/signups';
+import type { SignupSettings } from '@/schemas/signups';
 
 /** Server-loaded chrome snapshot. Title + description are then edited in-place via updateSignupMeta. */
 type SignupMeta = {
   title: string;
   description: string | null;
-  status: SignupStatus;
-  slug: string;
 };
 
 type BuildWysiwygProps = {
   signupId: string;
   signupMeta: SignupMeta;
   initialFields: SlotFieldDefinition[];
-  initialSlots: Array<{
-    id: string;
-    capacity: number | null;
-    sortOrder?: number | null;
-    values: Record<string, unknown>;
-  }>;
+  initialSlots: BuildSlot[];
   initialSettings: SignupSettings;
+  /**
+   * Spots taken per slot id when the page loaded; a slot with none is absent.
+   * Slots added in this session start empty, so they read 0 without an entry.
+   */
+  committedBySlot: Record<string, number>;
 };
 
 const EMPTY_GROUP_KEY = '__empty__';
@@ -80,6 +78,7 @@ export function BuildWysiwyg({
   initialFields,
   initialSlots,
   initialSettings,
+  committedBySlot,
 }: BuildWysiwygProps) {
   const {
     state,
@@ -94,23 +93,31 @@ export function BuildWysiwyg({
     duplicateRow,
     deleteRow,
     editCell,
+    renameGroup,
     setCapacity,
     moveRow,
   } = useBuildState(
     signupId,
     initialFields,
-    initialSlots.map((s) => ({
-      id: s.id,
-      capacity: s.capacity,
-      sortOrder: s.sortOrder ?? undefined,
-      values: s.values,
-    })),
+    initialSlots,
     initialSettings,
     { title: signupMeta.title, description: signupMeta.description },
   );
 
   const [fieldsOpen, setFieldsOpen] = useState(false);
   const [expandedRowId, setExpandedRowId] = useState<string | null>(null);
+  // A copy just made by Duplicate, whose editor takes focus when it opens.
+  // Cleared once it has: in a signup grouped by date, changing the copy's
+  // date remounts its editor in the new group, which must not take focus again.
+  const [focusRowId, setFocusRowId] = useState<string | null>(null);
+  const clearFocusRow = useCallback(() => setFocusRowId(null), []);
+  const expandRow = (rowId: string | null) => {
+    setFocusRowId(null);
+    setExpandedRowId(rowId);
+  };
+  // The group whose header change the server refused; its rows are back
+  // under their saved value, so this is that value's key.
+  const [failedRenameKey, setFailedRenameKey] = useState<string | null>(null);
 
   const groupField = state.groupByFieldRef
     ? state.fields.find((f) => f.ref === state.groupByFieldRef) ?? null
@@ -132,11 +139,8 @@ export function BuildWysiwyg({
           },
           onTransfer: (rowId, toGroupKey, toIdx) => {
             const newGroupValue = toGroupKey === EMPTY_GROUP_KEY ? '' : (toGroupKey ?? '');
-            editCell(rowId, groupField.ref, newGroupValue);
             const fromIdx = state.rows.findIndex((r) => r.id === rowId);
-            if (fromIdx >= 0 && fromIdx !== toIdx) {
-              void moveRow(fromIdx, toIdx);
-            }
+            void moveRow(fromIdx, toIdx, { fieldRef: groupField.ref, value: newGroupValue });
           },
         }
       : {}),
@@ -159,15 +163,18 @@ export function BuildWysiwyg({
   const handleRenameGroup = (oldKey: string, newKey: string) => {
     if (!groupField) return;
     if (newKey === oldKey) return;
-    // Rewrite every row in the group to the new group value. `editCell` is
-    // optimistic + debounced, so a burst of rewrites coalesces per row.
+    // Every row in the group takes the new group value.
     const ref = groupField.ref;
-    for (const r of state.rows) {
-      const raw = r.values[ref] ?? '';
-      const matches =
-        oldKey === EMPTY_GROUP_KEY ? raw === '' : raw === oldKey;
-      if (matches) editCell(r.id, ref, newKey);
-    }
+    const rowIds = state.rows
+      .filter((r) => {
+        const raw = r.values[ref] ?? '';
+        return oldKey === EMPTY_GROUP_KEY ? raw === '' : raw === oldKey;
+      })
+      .map((r) => r.id);
+    setFailedRenameKey(null);
+    void renameGroup(ref, rowIds, newKey).then((saved) => {
+      if (!saved) setFailedRenameKey(oldKey);
+    });
   };
 
   return (
@@ -186,8 +193,8 @@ export function BuildWysiwyg({
           <Editable
             value={state.title}
             onChange={(next) => updateSignupMeta({ title: next })}
-            placeholder="Untitled sign-up"
-            ariaLabel="Sign-up title"
+            placeholder="Untitled signup"
+            ariaLabel="Signup title"
             className="block text-[22px] font-bold tracking-[-0.02em] text-ink px-1 py-0.5 -mx-1 -my-0.5"
           />
 
@@ -197,7 +204,7 @@ export function BuildWysiwyg({
               onChange={(next) => updateSignupMeta({ description: next })}
               placeholder="Add a short description for volunteers"
               multiline
-              ariaLabel="Sign-up description"
+              ariaLabel="Signup description"
               className="block text-[13px] leading-snug text-ink-muted px-1 py-0.5 -mx-1 -my-0.5"
             />
           </div>
@@ -210,8 +217,12 @@ export function BuildWysiwyg({
                 groupField={groupField}
                 displayFields={displayFields}
                 fields={state.fields}
+                takenBySlot={committedBySlot}
+                remindersOn={state.reminderFieldRef !== null}
                 expandedRowId={expandedRowId}
-                onExpandRow={setExpandedRowId}
+                focusRowId={focusRowId}
+                onRowFocused={clearFocusRow}
+                onExpandRow={expandRow}
                 onEditCell={editCell}
                 onSetCapacity={(rowId, c) => setCapacity(rowId, c)}
                 onAddEnumOption={(fieldId, value) => {
@@ -225,13 +236,21 @@ export function BuildWysiwyg({
                     config: { fieldType: 'enum', choices: [...field.config.choices, value] },
                   });
                 }}
-                onDuplicateRow={(rowId) => { void duplicateRow(rowId); }}
+                onDuplicateRow={(rowId) => {
+                  // Open the copy: the next thing changed is usually its date (#557).
+                  void duplicateRow(rowId).then((copyId) => {
+                    if (copyId === null) return;
+                    setExpandedRowId(copyId);
+                    setFocusRowId(copyId);
+                  });
+                }}
                 onDeleteRow={(rowId) => {
-                  if (expandedRowId === rowId) setExpandedRowId(null);
+                  if (expandedRowId === rowId) expandRow(null);
                   void deleteRow(rowId);
                 }}
                 onAddSlot={handleAddSlot}
                 onRenameGroup={handleRenameGroup}
+                renameFailed={failedRenameKey === g.key}
                 reorder={slotReorder}
               />
             ))}

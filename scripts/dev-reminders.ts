@@ -25,20 +25,15 @@ async function main(): Promise<void> {
     console.log('No reminders are due right now.');
     console.log(
       'A reminder is due when the slot is still ahead and within the next 24\n' +
-        'hours, the participant signed up more than an hour ago and has not opted\n' +
-        'out, sendReminders is on for the signup, and no reminder.sent was\n' +
-        'recorded for the commitment yet.',
+        'hours, the participant gave an email, signed up more than an hour ago\n' +
+        'and has not opted out, sendReminders is on for the signup, and no\n' +
+        'reminder.sent was recorded for the commitment yet.',
     );
   } else {
     console.log(`${due.length} reminder(s) due:\n`);
-    for (const r of due) {
-      console.log(`  ${r.participantEmail}`);
-      console.log(`    ${r.signupTitle} · ${r.slotRef}`);
-      // The raw instant rather than formatSlotWhen: the dispatcher row carries
-      // no field definitions to say whether the slot has a time, and the ISO
-      // form is what the database holds (a date-only slot sits at 12:00Z).
-      console.log(`    ${r.slotAt?.toISOString() ?? 'no date'}  [${r.commitmentId}]`);
-    }
+    // The scan selects only the commitment id; look one up in `pnpm db:studio`
+    // for its participant, signup and slot.
+    for (const r of due) console.log(`  ${r.commitmentId}`);
     console.log('');
   }
 

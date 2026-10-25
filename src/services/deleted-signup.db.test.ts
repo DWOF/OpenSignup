@@ -15,16 +15,16 @@ import {
   cancelOwnCommitment,
   commitToSlot,
   getOwnCommitment,
+  removeCommitment,
   updateOwnCommitment,
 } from '@/services/commitments';
-import { lockSignupForWrite, readLiveSignup } from '@/services/locks';
+import { getSignupRowForOrganizer, lockSignupForWrite, readLiveSignup } from '@/services/locks';
 import {
   archiveSignup,
   closeSignup,
   createSignup,
   deleteSignup,
   getSignupForOrganizer,
-  getSignupRowForOrganizer,
   publishSignup,
   updateSignup,
 } from '@/services/signups';
@@ -223,6 +223,8 @@ const CALLS: Array<[string, Call]> = [
     (fx, s) => updateOwnCommitment(fx.db, s.commitmentId, s.editToken, { quantity: 4 }),
   ],
   ['cancelOwnCommitment', (fx, s) => cancelOwnCommitment(fx.db, s.commitmentId, s.editToken)],
+  // The organizer taking them off the slot instead.
+  ['removeCommitment', (fx, s) => removeCommitment(fx.db, fx.actor, s.commitmentId)],
   ['addSlot', (fx, s) => addSlot(fx.db, fx.actor, s.signupId, { values: { day: '2030-05-03' } })],
   [
     'addSlotsBulk',
@@ -230,7 +232,7 @@ const CALLS: Array<[string, Call]> = [
       addSlotsBulk(fx.db, fx.actor, s.signupId, { rows: [{ values: { day: '2030-05-04' } }] }),
   ],
   ['updateSlot', (fx, s) => updateSlot(fx.db, fx.actor, s.slotA, { capacity: 9 })],
-  ['deleteSlot', (fx, s) => deleteSlot(fx.db, fx.actor, s.slotB)],
+  ['deleteSlot', (fx, s) => deleteSlot(fx.db, fx.actor, s.slotB, { force: true })],
   [
     'reorderSlots',
     (fx, s) => reorderSlots(fx.db, fx.actor, s.signupId, { slotIds: [s.slotB, s.slotA] }),
@@ -340,15 +342,16 @@ describe('a service queued behind a signup delete (db)', () => {
     await expectRefusedBehindDelete(fx, name, call);
   });
 
-  // A participant's edit or cancel through their link, queued on their
-  // commitment's row while the delete commits. `getOwnCommitment` found the
-  // signup live before either got that far.
+  // A participant's edit or cancel through their link, or the organizer
+  // removing them, queued on their commitment's row while the delete commits.
+  // Each found the signup live before it got that far.
   const QUEUED_ON_COMMITMENT: Array<[string, Call]> = [
     [
       'updateOwnCommitment',
       (fx, s) => updateOwnCommitment(fx.db, s.commitmentId, s.editToken, { quantity: 3 }),
     ],
     ['cancelOwnCommitment', (fx, s) => cancelOwnCommitment(fx.db, s.commitmentId, s.editToken)],
+    ['removeCommitment', (fx, s) => removeCommitment(fx.db, fx.actor, s.commitmentId)],
   ];
 
   it.each(QUEUED_ON_COMMITMENT)('%s is not_found and writes nothing', async (name, call) => {

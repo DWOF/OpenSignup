@@ -24,7 +24,7 @@ export const createSignupTool = defineTool({
   name: 'create_signup',
   scope: 'signups:write',
   title: 'Create signup',
-  description: `Create a signup with its fields and slots in one step. It starts as a draft that participants cannot see until publish_signup. The result lists every field and slot with its id, so a slot id can go straight to update_slot or delete_slot without calling get_signup. If the result has a note instead of fields and slots, the signup was still created, and get_signup with its id returns it. The result includes links.edit to change the signup and links.preview to see what participants will see; links.public only says the signup is not ready yet until it is published. ${FIELD_GUIDE} groupBy names a field ref to group slots by on the public page. A value that does not fit its field makes the whole call fail with invalid_input and nothing is created, so fix the value and call again.`,
+  description: `Create a signup with its fields and slots in one step. It starts as a draft that participants cannot see until publish_signup. The result lists every field and slot with its id, so a slot id can go straight to update_slot or delete_slot without calling get_signup. If the result has a note instead of fields and slots, the signup was still created, and get_signup with its id returns it. The result includes links.edit to change the signup and links.preview to see what participants will see; links.public only says the signup is not ready yet until it is published. ${FIELD_GUIDE} groupBy names a field ref to group slots by on the public page. A value that does not fit its field, or a field with no value in any slot, makes the whole call fail with invalid_input and nothing is created, so fix the call and send it again.`,
   annotations: { readOnlyHint: false, destructiveHint: false },
   inputSchema: FullDraftSchema.extend({
     workspaceId: z.string().min(1).optional().describe('Defaults to the account default workspace.'),
@@ -69,24 +69,43 @@ export const createSignupTool = defineTool({
  * Every setting in UNREAD_SETTINGS is left out until something reads it.
  * Accepting maxCommitmentsPerParticipant told the organizer a limit was in
  * place when anyone could still take every spot. The others would do the same
- * for an optional email, a hidden notes box, names on the public page or a
- * confirmation message. Strict, so a client that sends one anyway is refused
- * rather than told the change went through.
+ * for a hidden notes box, names on the public page or a confirmation message.
+ * Strict, so a client that sends one anyway is refused rather than told the
+ * change went through.
+ *
+ * No defaults either: `.partial()` keeps each setting's `.default()`, which the
+ * JSON Schema advertises, and a client that fills in defaults would send
+ * `requireEmail: true` with an unrelated change and quietly undo the
+ * organizer's choice.
  */
-const SparseSettingsSchema = SignupSettingsSchema.removeDefault().omit(UNREAD_SETTINGS).partial().strict();
+const settingsShape = SignupSettingsSchema.removeDefault().omit(UNREAD_SETTINGS).shape;
+type WithoutDefaults<T extends z.ZodRawShape> = {
+  [K in keyof T]: T[K] extends z.ZodDefault<infer Inner> ? Inner : T[K];
+};
+const SparseSettingsSchema = z
+  .object(
+    Object.fromEntries(
+      Object.entries(settingsShape).map(([key, field]) => [
+        key,
+        field instanceof z.ZodDefault ? field.removeDefault() : field,
+      ]),
+    ) as WithoutDefaults<typeof settingsShape>,
+  )
+  .partial()
+  .strict();
 
 export const updateSignupTool = defineTool({
   name: 'update_signup',
   scope: 'signups:write',
   title: 'Update signup',
   description:
-    'Change a signup title, description, tags, closing time (ISO datetime, or null to remove it), visibility (public or unlisted) or settings. Only the settings you pass change. There is no setting to limit how many spots one person can take, make the email address optional, turn off notes, list who signed up on the public page (it shows only how full each slot is) or add a confirmation message. Use the field and slot tools to change what participants sign up for.',
+    'Change a signup title, description, tags, closing time (ISO datetime, or null to remove it) or settings. Only the settings you pass change. settings.requireEmail is true by default, and every participant must give an email address. Set to false, the email is optional: someone who leaves it blank gets no confirmation or reminder emails. Their link to change or cancel their spot is shown on screen, and only the browser they signed up in remembers it. Setting it back to true applies only to people who sign up after that; anyone who already signed up without an email keeps their spot. There is no setting to limit how many spots one person can take, turn off notes, list who signed up on the public page (it shows only how full each slot is) or add a confirmation message. Use the field and slot tools to change what participants sign up for.',
   annotations: { readOnlyHint: false, destructiveHint: true },
-  // organizerDisplayName is omitted on purpose: no column stores it, so
-  // accepting it would report a change that never happened.
+  // organizerDisplayName and visibility are omitted on purpose: no column
+  // stores the one and nothing reads the other, so accepting either would
+  // report a change that never happened.
   inputSchema: SignupUpdateInputSchema.omit({ settings: true, visibility: true, organizerDisplayName: true }).extend({
     signupId: z.string(),
-    visibility: z.enum(['public', 'unlisted']).optional(),
     settings: SparseSettingsSchema.optional(),
   }),
   handler: async (ctx, input) => {

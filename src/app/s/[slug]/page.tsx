@@ -11,10 +11,11 @@ import {
 } from '@/lib/returning-participant';
 import { INSTANCE_NAME } from '@/lib/site-config';
 import { readRequestSignals, recordPublicView } from '@/lib/view-tracker';
-import type { SignupStatus } from '@/schemas/signups';
 import { getOwnCommitmentsForSignup } from '@/services/commitments';
 import { loadPublicSignup } from '@/services/signups.cached';
-import SignupView, { toSignupViewFields, toSignupViewSlots } from './signup-view';
+import SignupView, {
+  toSignupViewProps,
+} from './signup-view';
 import { SignupStateMessage } from './state-message';
 
 type PageParams = { params: Promise<{ slug: string }> };
@@ -93,7 +94,6 @@ export default async function PublicSignupPage({ params }: PageParams) {
   const ownCommitments = found.map((c) => ({
     slotId: c.slotId,
     editUrl: commitmentEditUrl(slug, c.id, tokenById.get(c.id) ?? ''),
-    participantName: c.participantName,
   }));
 
   // Read headers in the request context — `after(...)` runs outside it and
@@ -109,11 +109,6 @@ export default async function PublicSignupPage({ params }: PageParams) {
       signals,
     }),
   );
-
-  const slots = toSignupViewSlots(sig, sig.committedBySlot);
-  const fields = toSignupViewFields(sig.fields);
-  const settings = (sig.settings ?? {}) as { groupByFieldRefs?: string[] };
-  const groupByRef = settings.groupByFieldRefs?.[0] ?? null;
 
   return (
     <main className="flex min-h-[100svh] flex-col pb-24 pt-10 sm:pt-14">
@@ -141,15 +136,7 @@ export default async function PublicSignupPage({ params }: PageParams) {
         </Link>
       </div>
       <SignupView
-        signup={{
-          title: sig.title,
-          description: sig.description,
-          status: sig.status as SignupStatus,
-        }}
-        fields={fields}
-        groupByRef={groupByRef}
-        slots={slots}
-        slug={slug}
+        {...toSignupViewProps(sig, sig.committedBySlot)}
         mode="live"
         ownCommitments={ownCommitments}
       />

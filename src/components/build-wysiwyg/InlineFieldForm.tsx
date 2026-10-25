@@ -1,9 +1,15 @@
 'use client';
 
 import { useEffect, useId, useRef, useState } from 'react';
-import { ArrowLeft, Info } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
+import { InlineNote } from '@/components/ui/inline-note';
 import { FIELD_TYPE_META } from '../build-shared/fieldTypes';
-import { FIELD_TYPES, type FieldType, type SlotFieldConfig } from '@/schemas/slot-fields';
+import {
+  FIELD_TYPES,
+  TEXT_DEFAULT_MAX_LENGTH,
+  type FieldType,
+  type SlotFieldConfig,
+} from '@/schemas/slot-fields';
 import type { BuildField } from '../build-shared/useBuildState';
 
 export type InlineFieldFormMode =
@@ -28,7 +34,7 @@ type InlineFieldFormProps = {
 function defaultConfigFor(type: FieldType): SlotFieldConfig {
   switch (type) {
     case 'text':
-      return { fieldType: 'text', maxLength: 200 };
+      return { fieldType: 'text', maxLength: TEXT_DEFAULT_MAX_LENGTH };
     case 'date':
       return { fieldType: 'date' };
     case 'time':
@@ -181,17 +187,10 @@ export function InlineFieldForm({
             </span>
           </label>
           {reminderBlocked && (
-            <div
-              id={reminderNoteId}
-              role="note"
-              className="mt-2 flex items-start gap-1.5 rounded-md bg-brand/10 px-2.5 py-2 text-[11px] leading-[1.35] text-ink-muted"
-            >
-              <Info size={12} className="mt-px shrink-0 text-brand" aria-hidden="true" />
-              <span>
-                <strong className="font-medium text-ink">{reminderFieldLabel}</strong> is already
-                the reminder field for this signup. Turn it off there to use this one instead.
-              </span>
-            </div>
+            <InlineNote id={reminderNoteId} className="mt-2">
+              <strong className="font-medium text-ink">{reminderFieldLabel}</strong> is already the
+              reminder field for this signup. Turn it off there to use this one instead.
+            </InlineNote>
           )}
         </div>
       )}

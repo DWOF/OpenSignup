@@ -1,19 +1,22 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
+import { SESSION_MAX_AGE_DAYS } from '@/auth/session-lifetime';
+import { pageMetadata } from '@/lib/seo';
 import { INSTANCE_NAME } from '@/lib/site-config';
 
-export const metadata: Metadata = {
+export const metadata: Metadata = pageMetadata({
+  path: '/cookies',
   title: 'Cookies',
   description: `Every cookie ${INSTANCE_NAME} sets, what each one is for, and how long it lasts — plus why there are no advertising or cross-site tracking cookies here.`,
-  alternates: { canonical: '/cookies' },
-};
+  siteName: INSTANCE_NAME,
+});
 
 export default function CookiesPage() {
   return (
     <>
       <header className="space-y-2">
         <h1 className="text-3xl font-semibold tracking-tight">Cookies</h1>
-        <p className="text-ink-muted text-sm">Last updated: 13 September 2026</p>
+        <p className="text-ink-muted text-sm">Last updated: 17 October 2026</p>
       </header>
 
       <section className="space-y-3">
@@ -45,7 +48,9 @@ export default function CookiesPage() {
                 <td className="px-4 py-3">
                   Keeps organizers signed in after they sign in.
                 </td>
-                <td className="px-4 py-3">Session</td>
+                <td className="px-4 py-3">
+                  {SESSION_MAX_AGE_DAYS} days from when you sign in
+                </td>
               </tr>
               <tr>
                 <td className="px-4 py-3 font-mono text-xs">
@@ -66,13 +71,28 @@ export default function CookiesPage() {
                 <td className="px-4 py-3">Short-lived</td>
               </tr>
               <tr>
+                <td className="px-4 py-3 font-mono text-xs">
+                  authjs.pkce.code_verifier (__Secure-authjs.pkce.code_verifier over HTTPS)
+                </td>
+                <td className="px-4 py-3">
+                  Checks that a Google sign-in finishing here is the one this browser
+                  started. Set only if this site has Google sign-in turned on and you use
+                  it.
+                </td>
+                <td className="px-4 py-3">15 minutes</td>
+              </tr>
+              <tr>
                 <td className="px-4 py-3 font-mono text-xs">os_commit</td>
                 <td className="px-4 py-3">
-                  Lets participants who already committed to a slot return and edit or
-                  cancel without re-entering their email. <code>httpOnly</code>; not
-                  readable from JavaScript.
+                  Keeps the private link to change or cancel each slot a participant
+                  signed up for, so they can come back from the same browser without
+                  finding the link again, whether or not they gave an email.{' '}
+                  <code>httpOnly</code>; not readable from JavaScript.
                 </td>
-                <td className="px-4 py-3">60 days</td>
+                <td className="px-4 py-3">
+                  60 days, or until a week after the latest slot it holds if that is later (at
+                  most 400 days)
+                </td>
               </tr>
               <tr>
                 <td className="px-4 py-3 font-mono text-xs">os_oauth_session</td>

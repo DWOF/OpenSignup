@@ -16,7 +16,8 @@ import {
   deleteField,
   listFields,
   listFieldsForSignup,
-  recomputeSlotAtForSignup,
+  rebuildSlotAt,
+  reorderFields,
   updateField,
 } from '@/services/slot-fields';
 import { lockSignupForWrite, lockSlotsForSignup } from '@/services/locks';
@@ -279,6 +280,44 @@ describe('slot-fields service (db)', () => {
       const listed = await listFields(fx.db, fx.actor, sigId);
       if (!listed.ok) throw new Error('list failed');
       expect(listed.value.map((f) => f.ref)).toEqual(['first', 'added']);
+    });
+
+    it('a field at the top of the order column does not stop the next add', async () => {
+      const sigId = await createTestSignup(fx, 'Field order at the top');
+      const top = 2_147_483_647;
+      const pinned = await addField(fx.db, fx.actor, sigId, {
+        ref: 'last',
+        label: 'Last',
+        fieldType: 'text',
+        config: { fieldType: 'text' },
+        sortOrder: top,
+      });
+      expect(pinned.ok, JSON.stringify(pinned)).toBe(true);
+      // One past it is out of range for the column; the add ties there instead.
+      const r = await addField(fx.db, fx.actor, sigId, {
+        ref: 'after',
+        label: 'After',
+        fieldType: 'text',
+        config: { fieldType: 'text' },
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      if (r.ok) expect(r.value.sortOrder).toBe(top);
+    });
+
+    it('refuses a sortOrder past the top of the order column as invalid_input', async () => {
+      const sigId = await createTestSignup(fx, 'Field order out of range');
+      const r = await addField(fx.db, fx.actor, sigId, {
+        ref: 'far',
+        label: 'Far',
+        fieldType: 'text',
+        config: { fieldType: 'text' },
+        sortOrder: 3_000_000_000,
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe('invalid_input');
+        expect(r.error.field).toBe('sortOrder');
+      }
     });
 
     it('adds a text, number or enum field without waiting for someone part-way through signing up', async () => {
@@ -1168,7 +1207,44 @@ describe('slot-fields service (db)', () => {
     });
   });
 
-  describe('recomputeSlotAtForSignup', () => {
+  describe('a field reached through another signup', () => {
+    // The field routes nest the field under a signup id. Named with a
+    // signup in the same workspace that isn't its own, a field is not found.
+    async function fieldOfAnotherSignup(): Promise<{ otherId: string; fieldId: string }> {
+      const ownId = await createTestSignup(fx, 'Owns the field');
+      const otherId = await createTestSignup(fx, 'Named in the URL');
+      const created = await addField(fx.db, fx.actor, ownId, {
+        ref: 'teacher',
+        label: 'Teacher',
+        fieldType: 'text',
+        config: { fieldType: 'text' },
+      });
+      if (!created.ok) throw new Error('setup failed');
+      return { otherId, fieldId: created.value.id };
+    }
+
+    it('updateField answers not_found and leaves the field as it was', async () => {
+      const { otherId, fieldId } = await fieldOfAnotherSignup();
+      const r = await updateField(fx.db, fx.actor, fieldId, { label: 'Renamed' }, otherId);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe('not_found');
+
+      const [after] = await fx.db.select().from(slotFields).where(eq(slotFields.id, fieldId));
+      expect(after?.label).toBe('Teacher');
+    });
+
+    it('deleteField answers not_found and leaves the field in place', async () => {
+      const { otherId, fieldId } = await fieldOfAnotherSignup();
+      const r = await deleteField(fx.db, fx.actor, fieldId, otherId);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe('not_found');
+
+      const after = await fx.db.select().from(slotFields).where(eq(slotFields.id, fieldId));
+      expect(after).toHaveLength(1);
+    });
+  });
+
+  describe('rebuildSlotAt', () => {
     it('writes only the slots that move, to a new instant or to none, in one pass', async () => {
       const sigId = await createTestSignup(fx, 'Rebuild in one statement');
       for (const [ref, fieldType] of [
@@ -1200,11 +1276,15 @@ describe('slot-fields service (db)', () => {
 
       const r = await fx.db.transaction(async (tx) => {
         // Move the anchor underneath the rebuild, as updateSignup does.
-        await tx
-          .update(signups)
-          .set({ settings: { reminderFromFieldRef: 'day2' } })
-          .where(eq(signups.id, sigId));
-        return recomputeSlotAtForSignup(tx, sigId, fx.workspaceId);
+        const settings = { reminderFromFieldRef: 'day2' };
+        await tx.update(signups).set({ settings }).where(eq(signups.id, sigId));
+        return rebuildSlotAt(
+          tx,
+          sigId,
+          fx.workspaceId,
+          settings,
+          await listFieldsForSignup(tx, sigId),
+        );
       });
       expect(r).toEqual({ updated: 2 });
       expect(await at(moves)).toBe('2026-07-04T09:30:00.000Z');
@@ -1236,7 +1316,13 @@ describe('slot-fields service (db)', () => {
         // check in JS sees that slot move on every rebuild; Postgres sees it
         // has not.
         await tx.execute(sql`set local time zone 'Europe/Amsterdam'`);
-        return recomputeSlotAtForSignup(tx, sigId, fx.workspaceId);
+        return rebuildSlotAt(
+          tx,
+          sigId,
+          fx.workspaceId,
+          { reminderFromFieldRef: 'day' },
+          await listFieldsForSignup(tx, sigId),
+        );
       });
       expect(r).toEqual({ updated: 0 });
       expect(await Promise.all(ids.map(rowVersion))).toEqual(before);
@@ -1264,11 +1350,15 @@ describe('slot-fields service (db)', () => {
         .where(eq(slots.id, slot.value.id));
 
       const r = await fx.db.transaction(async (tx) => {
-        await tx
-          .update(signups)
-          .set({ settings: { reminderFromFieldRef: 'day2' } })
-          .where(eq(signups.id, sigId));
-        return recomputeSlotAtForSignup(tx, sigId, fx.workspaceId);
+        const settings = { reminderFromFieldRef: 'day2' };
+        await tx.update(signups).set({ settings }).where(eq(signups.id, sigId));
+        return rebuildSlotAt(
+          tx,
+          sigId,
+          fx.workspaceId,
+          settings,
+          await listFieldsForSignup(tx, sigId),
+        );
       });
       expect(r).toEqual({ updated: 1 });
       const [row] = await fx.db.select().from(slots).where(eq(slots.id, slot.value.id));
@@ -1487,6 +1577,263 @@ describe('slot-fields service (db)', () => {
       expect(r.ok).toBe(true);
       if (!r.ok) return;
       expect(r.value.map((f) => f.ref)).toEqual(['a', 'b']);
+    });
+
+    it('breaks a tie on sortOrder and createdAt by id, so every read agrees', async () => {
+      const sigId = await createTestSignup(fx, 'List tie');
+      // createSignup writes all its fields in one transaction, so they share a
+      // createdAt; two of them on one sortOrder had no fixed order.
+      const createdAt = new Date('2026-01-01T00:00:00Z');
+      const ids = [makeId('fld'), makeId('fld')].sort();
+      await fx.db.insert(slotFields).values(
+        [ids[1]!, ids[0]!].map((id, i) => ({
+          id,
+          signupId: sigId,
+          workspaceId: fx.workspaceId,
+          ref: `tied-${i}`,
+          label: `Tied ${i}`,
+          fieldType: 'text' as const,
+          sortOrder: 0,
+          config: { fieldType: 'text' },
+          createdAt,
+        })),
+      );
+      const fields = await listFieldsForSignup(fx.db, sigId);
+      expect(fields.map((f) => f.id)).toEqual(ids);
+    });
+  });
+
+  describe('field order', () => {
+    const textField = (ref: string) =>
+      ({ ref, label: ref, fieldType: 'text', config: { fieldType: 'text' } }) as const;
+
+    async function signupWith(
+      title: string,
+      refs: string[],
+    ): Promise<{ sigId: string; ids: string[] }> {
+      const sigId = await createTestSignup(fx, title);
+      const ids: string[] = [];
+      for (const ref of refs) {
+        const r = await addField(fx.db, fx.actor, sigId, textField(ref));
+        if (!r.ok) throw new Error(`${ref} setup failed`);
+        ids.push(r.value.id);
+      }
+      return { sigId, ids };
+    }
+
+    const order = async (sigId: string) =>
+      (await listFieldsForSignup(fx.db, sigId)).map((f) => [f.ref, f.sortOrder]);
+
+    it('addField with beforeFieldId goes in front of that field and renumbers the rest', async () => {
+      const { sigId, ids } = await signupWith('Add before', ['what', 'who']);
+      const r = await addField(fx.db, fx.actor, sigId, {
+        ...textField('first'),
+        beforeFieldId: ids[0],
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      if (r.ok) expect(r.value.sortOrder).toBe(0);
+      expect(await order(sigId)).toEqual([
+        ['first', 0],
+        ['what', 1],
+        ['who', 2],
+      ]);
+
+      const mid = await addField(fx.db, fx.actor, sigId, {
+        ...textField('mid'),
+        beforeFieldId: ids[1],
+      });
+      expect(mid.ok, JSON.stringify(mid)).toBe(true);
+      expect(await order(sigId)).toEqual([
+        ['first', 0],
+        ['what', 1],
+        ['mid', 2],
+        ['who', 3],
+      ]);
+      const acts = await fx.db.select().from(activity).where(eq(activity.signupId, sigId));
+      expect(
+        acts.find(
+          (a) => a.eventType === 'field.created' && (a.payload as { ref: string }).ref === 'mid',
+        )?.payload,
+      ).toMatchObject({ beforeFieldId: ids[1] });
+    });
+
+    it('addField with beforeFieldId unties fields that shared a sortOrder', async () => {
+      const { sigId } = await signupWith('Add before a tie', ['what', 'who']);
+      await fx.db.update(slotFields).set({ sortOrder: 0 }).where(eq(slotFields.signupId, sigId));
+      const tied = await listFieldsForSignup(fx.db, sigId);
+      const shown = tied.map((f) => f.ref);
+      const r = await addField(fx.db, fx.actor, sigId, {
+        ...textField('first'),
+        beforeFieldId: tied[0]!.id,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      expect(await order(sigId)).toEqual([
+        ['first', 0],
+        [shown[0], 1],
+        [shown[1], 2],
+      ]);
+    });
+
+    it('addField refuses a beforeFieldId from another signup, or with a sortOrder', async () => {
+      const { sigId } = await signupWith('Add before refused', ['what']);
+      const other = await signupWith('Add before other', ['elsewhere']);
+      const foreign = await addField(fx.db, fx.actor, sigId, {
+        ...textField('nope'),
+        beforeFieldId: other.ids[0],
+      });
+      expect(foreign.ok).toBe(false);
+      if (!foreign.ok)
+        expect(foreign.error).toMatchObject({ code: 'invalid_input', field: 'beforeFieldId' });
+      const both = await addField(fx.db, fx.actor, sigId, {
+        ...textField('nope'),
+        beforeFieldId: (await listFieldsForSignup(fx.db, sigId))[0]!.id,
+        sortOrder: 0,
+      });
+      expect(both.ok).toBe(false);
+      if (!both.ok) expect(both.error).toMatchObject({ code: 'invalid_input', field: 'sortOrder' });
+      expect(await order(sigId)).toEqual([['what', 0]]);
+    });
+
+    it('reorderFields numbers the fields 0..n-1 in the order given and logs it', async () => {
+      const { sigId, ids } = await signupWith('Reorder fields', ['a', 'b', 'c']);
+      const reversed = [...ids].reverse();
+      const r = await reorderFields(fx.db, fx.actor, sigId, { fieldIds: reversed });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      if (r.ok) expect(r.value.map((f) => f.id)).toEqual(reversed);
+      for (let i = 0; i < 3; i++) {
+        expect(await order(sigId)).toEqual([
+          ['c', 0],
+          ['b', 1],
+          ['a', 2],
+        ]);
+      }
+      const acts = await fx.db.select().from(activity).where(eq(activity.signupId, sigId));
+      expect(acts.find((a) => a.eventType === 'field.reordered')?.payload).toEqual({
+        fieldIds: reversed,
+      });
+    });
+
+    it('reorderFields refuses a list that is not every field once, and changes nothing', async () => {
+      const { sigId, ids } = await signupWith('Reorder fields refused', ['a', 'b']);
+      const other = await signupWith('Reorder fields other', ['x']);
+      for (const [fieldIds, details] of [
+        [[ids[1]!], { missing: [ids[0]] }],
+        [[ids[1]!, ids[0]!, ids[0]!], { duplicates: [ids[0]] }],
+        [[ids[1]!, ids[0]!, other.ids[0]!], { unknown: [other.ids[0]] }],
+      ] as const) {
+        const r = await reorderFields(fx.db, fx.actor, sigId, { fieldIds });
+        expect(r.ok).toBe(false);
+        if (!r.ok)
+          expect(r.error).toMatchObject({ code: 'invalid_input', field: 'fieldIds', details });
+      }
+      expect(await order(sigId)).toEqual([
+        ['a', 0],
+        ['b', 1],
+      ]);
+    });
+
+    it('reorderFields moves slot_at when it changes which time pairs with the date', async () => {
+      const sigId = await createTestSignup(fx, 'Reorder re-anchors');
+      const ids: Record<string, string> = {};
+      for (const [ref, fieldType] of [
+        ['day', 'date'],
+        ['start', 'time'],
+        ['end', 'time'],
+      ] as const) {
+        const f = await addField(fx.db, fx.actor, sigId, {
+          ref,
+          label: ref,
+          fieldType,
+          config: { fieldType },
+        });
+        if (!f.ok) throw new Error(`${ref} setup failed`);
+        ids[ref] = f.value.id;
+      }
+      const slot = await addSlot(fx.db, fx.actor, sigId, {
+        values: { day: '2026-05-10', start: '09:00', end: '17:00' },
+      });
+      if (!slot.ok) throw new Error('slot setup failed');
+      const at = async () =>
+        (
+          await fx.db.select().from(slots).where(eq(slots.id, slot.value.id))
+        )[0]?.slotAt?.toISOString();
+      expect(await at()).toBe('2026-05-10T09:00:00.000Z');
+
+      const r = await reorderFields(fx.db, fx.actor, sigId, {
+        fieldIds: [ids.day!, ids.end!, ids.start!],
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      expect(await at()).toBe('2026-05-10T17:00:00.000Z');
+    });
+
+    it('addField with beforeFieldId rebuilds slot_at when the renumbering unties two times', async () => {
+      const sigId = await createTestSignup(fx, 'Add before re-anchors');
+      const ids: Record<string, string> = {};
+      for (const [ref, fieldType] of [
+        ['day', 'date'],
+        ['start', 'time'],
+        ['end', 'time'],
+      ] as const) {
+        const f = await addField(fx.db, fx.actor, sigId, {
+          ref,
+          label: ref,
+          fieldType,
+          config: { fieldType },
+        });
+        if (!f.ok) throw new Error(`${ref} setup failed`);
+        ids[ref] = f.value.id;
+      }
+      // start and end tied: reminder-fields breaks the tie by ref, so end
+      // pairs with the date, while the list (by createdAt) shows start first.
+      await fx.db.update(slotFields).set({ sortOrder: 1 }).where(eq(slotFields.id, ids.end!));
+      const slot = await addSlot(fx.db, fx.actor, sigId, {
+        values: { day: '2026-05-10', start: '09:00', end: '17:00' },
+      });
+      if (!slot.ok) throw new Error('slot setup failed');
+      const at = async () =>
+        (
+          await fx.db.select().from(slots).where(eq(slots.id, slot.value.id))
+        )[0]?.slotAt?.toISOString();
+      expect(await at()).toBe('2026-05-10T17:00:00.000Z');
+
+      const r = await addField(fx.db, fx.actor, sigId, {
+        ...textField('notes'),
+        beforeFieldId: ids.day!,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      expect(await order(sigId)).toEqual([
+        ['notes', 0],
+        ['day', 1],
+        ['start', 2],
+        ['end', 3],
+      ]);
+      expect(await at()).toBe('2026-05-10T09:00:00.000Z');
+    });
+
+    it('reorderFields leaves the slot rows alone when only a text column moves', async () => {
+      const sigId = await createTestSignup(fx, 'Reorder text only');
+      const ids: string[] = [];
+      for (const [ref, fieldType] of [
+        ['what', 'text'],
+        ['day', 'date'],
+      ] as const) {
+        const f = await addField(fx.db, fx.actor, sigId, {
+          ref,
+          label: ref,
+          fieldType,
+          config: { fieldType },
+        });
+        if (!f.ok) throw new Error(`${ref} setup failed`);
+        ids.push(f.value.id);
+      }
+      const slot = await addSlot(fx.db, fx.actor, sigId, {
+        values: { what: 'Fruit', day: '2026-05-10' },
+      });
+      if (!slot.ok) throw new Error('slot setup failed');
+      const before = await rowVersion(slot.value.id);
+      const r = await reorderFields(fx.db, fx.actor, sigId, { fieldIds: [ids[1]!, ids[0]!] });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      expect(await rowVersion(slot.value.id)).toBe(before);
     });
   });
 

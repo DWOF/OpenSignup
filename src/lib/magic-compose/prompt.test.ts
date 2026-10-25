@@ -2,17 +2,19 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RULES_IN_BOTH } from '@/lib/signup-rules';
+import { SignupCreateInputSchema } from '@/schemas/signups';
+import { SlotFieldInputSchema } from '@/schemas/slot-fields';
 import {
+  DraftFieldSchema,
+  FullDraftSchema,
   MagicComposeDraftSchema,
   MAX_FIELDS,
   MAX_SLOTS,
-  RESPONSE_JSON_SCHEMA,
   buildMessages,
-  getSystemPromptForTests,
 } from './prompt';
 
 describe('system prompt', () => {
-  const sys = getSystemPromptForTests();
+  const sys = buildMessages('x')[0]!.content;
 
   it('lists the closed fieldType enum', () => {
     expect(sys).toContain('text, date, time, number, enum');
@@ -147,16 +149,78 @@ describe('MagicComposeDraftSchema', () => {
   });
 });
 
-describe('RESPONSE_JSON_SCHEMA', () => {
-  it('declares every top-level property the Zod schema accepts', () => {
-    // Locks Zod ↔ JSON-Schema drift. If a new property is added to the Zod
-    // schema, it must be mirrored here (or vice versa).
-    const props = RESPONSE_JSON_SCHEMA.schema.properties;
-    expect(props).toHaveProperty('title');
-    expect(props).toHaveProperty('description');
-    expect(props).toHaveProperty('fields');
-    expect(props).toHaveProperty('slots');
-    expect(props).toHaveProperty('groupBy');
-    expect(props).toHaveProperty('refusalReason');
+describe('draft limits', () => {
+  // The draft is the input of Magic Compose and of the MCP create_signup and
+  // add_field tools, so it must refuse exactly what the services refuse.
+  const lengths = Array.from({ length: 2100 }, (_, n) => n);
+  const accepts = (schema: { safeParse(v: unknown): { success: boolean } }, v: unknown) =>
+    schema.safeParse(v).success;
+
+  it('takes field labels of the same lengths as a slot field', () => {
+    for (const n of lengths.slice(0, 200)) {
+      const label = 'a'.repeat(n);
+      expect(accepts(DraftFieldSchema, { ref: 'x', label, fieldType: 'text' }), `label ${n}`).toBe(
+        accepts(SlotFieldInputSchema, {
+          ref: 'x',
+          label,
+          fieldType: 'text',
+          config: { fieldType: 'text' },
+        }),
+      );
+    }
+  });
+
+  it('takes the same refs as a slot field', () => {
+    for (const ref of ['', 'a', 'a-b', 'A', 'a_b', '-a', 'a--b', 'a'.repeat(40), 'a'.repeat(41)]) {
+      expect(accepts(DraftFieldSchema, { ref, label: 'X', fieldType: 'text' }), `ref ${ref}`).toBe(
+        accepts(SlotFieldInputSchema, {
+          ref,
+          label: 'X',
+          fieldType: 'text',
+          config: { fieldType: 'text' },
+        }),
+      );
+    }
+  });
+
+  it('takes the same choices as an enum field, apart from allowing none', () => {
+    const enumField = (choices: string[]) => ({
+      ref: 'x',
+      label: 'X',
+      fieldType: 'enum' as const,
+      config: { fieldType: 'enum' as const, choices },
+    });
+    for (const n of lengths.slice(0, 100)) {
+      const choices = ['a'.repeat(n)];
+      expect(accepts(DraftFieldSchema, { ...enumField(choices), choices }), `choice ${n}`).toBe(
+        accepts(SlotFieldInputSchema, enumField(choices)),
+      );
+    }
+    for (const n of lengths.slice(1, 40)) {
+      const choices = Array.from({ length: n }, (_, i) => `c${i}`);
+      expect(accepts(DraftFieldSchema, { ...enumField(choices), choices }), `${n} choices`).toBe(
+        accepts(SlotFieldInputSchema, enumField(choices)),
+      );
+    }
+  });
+
+  it('takes titles and descriptions of the same lengths as a new signup', () => {
+    const draft = {
+      title: 'Snack duty',
+      fields: [{ ref: 'x', label: 'X', fieldType: 'text' }],
+      slots: [{ values: {} }],
+    };
+    for (const n of lengths.slice(0, 200)) {
+      const title = 'a'.repeat(n);
+      expect(accepts(FullDraftSchema, { ...draft, title }), `title ${n}`).toBe(
+        accepts(SignupCreateInputSchema, { title }),
+      );
+    }
+    for (const n of lengths) {
+      const description = 'a'.repeat(n);
+      expect(accepts(FullDraftSchema, { ...draft, description }), `description ${n}`).toBe(
+        accepts(SignupCreateInputSchema, { title: 'Snack duty', description }),
+      );
+    }
   });
 });

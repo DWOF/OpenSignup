@@ -70,6 +70,10 @@ export function buildProvider(deps: ProviderDeps): Provider {
       id_token_signed_response_alg: SIGNING_ALG,
     },
     clientAuthMethods: ['none'],
+    extraClientMetadata: {
+      properties: ['token_endpoint_auth_methods_supported'],
+      validator: publicIfNoneSupported,
+    },
     responseTypes: ['code'],
     scopes: PROVIDER_SCOPES,
     claims: { openid: ['sub'] },
@@ -215,6 +219,24 @@ function alwaysConsentPolicy() {
   return policy;
 }
 
+/**
+ * ChatGPT's CIMD document names `private_key_jwt` as its
+ * `token_endpoint_auth_method` but lists `none` in
+ * `token_endpoint_auth_methods_supported` (its own field, not RFC 7591). A
+ * client that says it can be public is treated as one, so it gets PKCE and
+ * rotating refresh tokens like every other client. The library calls this
+ * before its own checks, for every client, static ones included.
+ *
+ * This holds only while `clientAuthMethods` is `['none']`: the library then
+ * drops a `client_assertion` from token requests. Enable `private_key_jwt`
+ * and a client switched here that still sends one is rejected, as is a
+ * `none` client whose document carries `token_endpoint_auth_signing_alg`.
+ */
+function publicIfNoneSupported(_ctx: unknown, key: string, value: unknown, metadata: ClientMetadata): void {
+  if (key !== 'token_endpoint_auth_methods_supported' || !Array.isArray(value)) return;
+  if (value.includes('none')) metadata.token_endpoint_auth_method = 'none';
+}
+
 interface OidcError {
   error?: string;
   error_description?: string;
@@ -236,6 +258,15 @@ function toClientMetadata(c: StaticClient): ClientMetadata {
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+}
+
+/**
+ * How long a rate-limited browser should wait, for the error page's sentence
+ * ("Wait 40 minutes and try again."). Shared by every OAuth 429 page so their
+ * wording can't drift.
+ */
+export function describeWait(retryAfterSeconds: number): string {
+  return retryAfterSeconds >= 120 ? `${Math.ceil(retryAfterSeconds / 60)} minutes` : `${retryAfterSeconds} seconds`;
 }
 
 /**

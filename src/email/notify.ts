@@ -9,21 +9,15 @@
  * Every function here swallows its own errors: a confirmation email is a
  * courtesy, and losing one must never look like a failed sign-up.
  */
-import { and, eq, sql } from 'drizzle-orm';
 import type { Db } from '@/db/client';
-import { activity } from '@/db/schema/activity';
-import { commitments } from '@/db/schema/commitments';
-import { participants } from '@/db/schema/participants';
-import { signups } from '@/db/schema/signups';
-import { slots } from '@/db/schema/slots';
 import { recordActivity } from '@/lib/activity';
 import { commitmentEditUrl } from '@/lib/links';
 import { log } from '@/lib/log';
+import { chargeRateLimit, RateLimits } from '@/lib/rate-limit';
 import { willSendReminder } from '@/lib/reminder-eligibility';
-import { slotDetails } from '@/lib/slot-label';
-import { summarizeSlotValues } from '@/lib/slot-summary';
-import { SignupSettingsSchema } from '@/schemas/signups';
-import { listFieldsForSignup } from '@/services/slot-fields';
+import { normalizeEmail } from '@/schemas/common';
+import { sendsReminders } from '@/schemas/signups';
+import { alreadyRecorded, loadCommitmentRow, slotText } from './commitment-row';
 import { sendCommitmentConfirmation } from './send';
 
 /**
@@ -33,26 +27,22 @@ import { sendCommitmentConfirmation } from './send';
  * Unlike reminders this is transactional — it acknowledges an action the
  * participant took seconds ago — so it is not gated on the signup's reminder
  * settings.
+ *
+ * `meterRecipient` charges the recipient's address against the same
+ * per-address limit signing up uses. Signing up charges it before the commit,
+ * from the address in the request; a move has no address in its request, so
+ * the move route asks for it here, where the address is known. Over the limit,
+ * the email is skipped and the move stands. If the limit can't be checked at
+ * all, the email is skipped too, like any other failure here.
  */
 export async function notifyCommitmentCreated(
   db: Db,
   commitmentId: string,
   editToken: string,
+  opts: { meterRecipient?: boolean } = {},
 ): Promise<void> {
   try {
-    const [row] = await db
-      .select({
-        commitment: commitments,
-        slot: slots,
-        signup: signups,
-        participant: participants,
-      })
-      .from(commitments)
-      .innerJoin(slots, eq(slots.id, commitments.slotId))
-      .innerJoin(signups, eq(signups.id, commitments.signupId))
-      .innerJoin(participants, eq(participants.id, commitments.participantId))
-      .where(eq(commitments.id, commitmentId))
-      .limit(1);
+    const row = await loadCommitmentRow(db, commitmentId);
 
     if (!row) {
       log.warn({ commitmentId }, 'commitment not found for confirmation email');
@@ -66,56 +56,54 @@ export async function notifyCommitmentCreated(
       log.info({ commitmentId }, 'signup deleted; no confirmation email');
       return;
     }
+    // Signed up without an email: there is nowhere to send one. The response
+    // that made the commitment, a sign-up or a move, carries its edit link
+    // and puts it in the returning-participant cookie.
+    const to = row.participant.email;
+    if (to === null) {
+      log.info({ commitmentId }, 'participant has no email; no confirmation email');
+      return;
+    }
 
     // Belt and braces, not the primary defence. This is a read-then-write with
     // no lock, so it would not survive two concurrent calls for the same
     // commitment — but there is no path that produces them. This runs once per
     // successful POST (from `after()`), each successful POST inserts exactly
-    // one commitment with a fresh UUIDv7 id, and a racing duplicate commit by
+    // one commitment with a fresh UUIDv7 id, a racing duplicate commit by
     // the same participant is rejected as `conflict` under the slot's
-    // SELECT ... FOR UPDATE (src/services/commitments.ts). The check earns its
+    // SELECT ... FOR UPDATE (src/services/commitments.ts), and a retry with
+    // the same idempotency key gets the first commitment back and is not
+    // sent from (`repeated`, in the POST route). The check earns its
     // place only against a future caller that retries; if one is ever added,
     // the claim has to move before the send, not after it — an atomic guard
     // here would still leave the email already sent.
-    const [alreadySent] = await db
-      .select({ id: activity.id })
-      .from(activity)
-      .where(
-        and(
-          eq(activity.eventType, 'commitment.confirmation_sent'),
-          // Scoped to the signup as well as the commitment: the row carries
-          // signup_id anyway, and it keeps this off a full scan of every
-          // confirmation ever sent even where the expression index is absent.
-          eq(activity.signupId, row.signup.id),
-          sql`(${activity.payload}->>'commitmentId') = ${commitmentId}`,
-        ),
-      )
-      .limit(1);
-    if (alreadySent) return;
+    if (await alreadyRecorded(db, 'commitment.confirmation_sent', row.signup.id, commitmentId)) {
+      return;
+    }
 
-    const settings = SignupSettingsSchema.safeParse(row.signup.settings ?? {});
+    if (opts.meterRecipient) {
+      if ((await chargeRateLimit(db, RateLimits.commitmentPerEmail, normalizeEmail(to))) !== null) {
+        log.info({ commitmentId }, 'recipient over the per-address limit; no confirmation email');
+        return;
+      }
+    }
+
     // Only promise a reminder the dispatcher would actually send. The gate is
     // the dispatcher's own rule (src/lib/reminder-eligibility.ts), not a
     // paraphrase of it: reminders on and a slot date are not enough, because a
     // slot less than an hour out is one the created_at guard can never reach.
-    const remindersOn = settings.success ? settings.data.sendReminders : true;
     const promisesReminder = willSendReminder({
-      sendReminders: remindersOn,
+      sendReminders: sendsReminders(row.signup.settings),
       slotAt: row.slot.slotAt,
       createdAt: row.commitment.createdAt,
+      remindersOptedOutAt: row.participant.remindersOptedOutAt,
     });
 
-    // Every field the organizer defined, rendered the way the participant page
-    // renders it. `slots.ref` is a slug and never appears here.
-    const fields = await listFieldsForSignup(db, row.signup.id);
-    const slotValues = (row.slot.values as Record<string, unknown>) ?? {};
-
-    await sendCommitmentConfirmation(row.participant.email, {
+    await sendCommitmentConfirmation(to, {
       participantName: row.participant.name,
       signupTitle: row.signup.title,
       manageUrl: commitmentEditUrl(row.signup.slug, row.commitment.id, editToken),
-      slotDetails: slotDetails(fields, slotValues),
-      slotSummary: summarizeSlotValues(fields, slotValues),
+      ...(await slotText(db, row.signup.id, row.slot.values)),
       notes: row.commitment.notes,
       quantity: row.commitment.quantity,
       promisesReminder,

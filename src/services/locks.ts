@@ -1,11 +1,26 @@
 import { and, asc, eq, isNull } from 'drizzle-orm';
-import type { Queryable, Tx } from '@/db/client';
-import { signups } from '@/db/schema/signups';
+import type { Db, Queryable, Tx } from '@/db/client';
+import type { activity } from '@/db/schema/activity';
+import type { commitments } from '@/db/schema/commitments';
+import type { participants } from '@/db/schema/participants';
+import { signups, type Signup as SignupRow } from '@/db/schema/signups';
 import { slots } from '@/db/schema/slots';
+import { serviceError, type ServiceError } from '@/lib/errors';
+import { requireWorkspaceAccess, requireWorkspaceWrite, type Actor } from '@/lib/policy';
+import { err, ok, type Result } from '@/lib/result';
 
-/** `workspace_id = ?`, where null (guest scope) matches only rows with no workspace. */
-function inWorkspace(
-  column: typeof signups.workspaceId | typeof slots.workspaceId,
+/**
+ * `workspace_id = ?`, where null matches only rows with no workspace, such as
+ * page-view activity rows. It never widens a query, and the policy guards
+ * refuse a null workspace outright, so it grants nothing either.
+ */
+export function inWorkspace(
+  column:
+    | typeof signups.workspaceId
+    | typeof slots.workspaceId
+    | typeof participants.workspaceId
+    | typeof commitments.workspaceId
+    | typeof activity.workspaceId,
   workspaceId: string | null,
 ) {
   return workspaceId === null ? isNull(column) : eq(column, workspaceId);
@@ -40,12 +55,58 @@ export async function readLiveSignup(db: Queryable, signupId: string) {
 }
 
 /**
+ * Loads one signup for reading and judges access to it, for callers that then
+ * read something hanging off the row (its slots, its fields, its activity
+ * log, its CSV export). A soft-deleted signup is not found (`readLiveSignup`),
+ * as it is to the organizer's list and the public page, so nothing reached
+ * through this serves a deleted signup's participants.
+ */
+export async function getSignupRowForOrganizer(
+  db: Db,
+  actor: Actor,
+  signupId: string,
+): Promise<Result<SignupRow, ServiceError>> {
+  const row = await readLiveSignup(db, signupId);
+  if (!row) return err(serviceError('not_found', 'signup not found'));
+  requireWorkspaceAccess(actor, row.workspaceId);
+  return ok(row);
+}
+
+/**
+ * Runs `work` as a write to one signup, opened the way every such write
+ * opens: find the live signup (not found when there is none, or it is
+ * deleted), judge the actor against its workspace, start a transaction, lock
+ * the row (`lockSignupForWrite`) and read it again under the lock, which is
+ * not found too when a delete committed while this waited. `work` gets the
+ * transaction and the row as read under the lock, so a write cannot forget
+ * the check after the lock, which is the one that kept going missing.
+ */
+export async function withSignupWriteLock<T>(
+  db: Db,
+  actor: Actor,
+  signupId: string,
+  work: (tx: Tx, signup: SignupRow) => Promise<Result<T, ServiceError>>,
+): Promise<Result<T, ServiceError>> {
+  const found = await readLiveSignup(db, signupId);
+  if (!found) return err(serviceError('not_found', 'signup not found'));
+  requireWorkspaceWrite(actor, found.workspaceId);
+
+  return db.transaction(async (tx) => {
+    const locked = await lockSignupForWrite(tx, signupId, found.workspaceId);
+    if (!locked) return err(serviceError('not_found', 'signup not found'));
+    return work(tx, locked);
+  });
+}
+
+/**
  * Locks the signup row until the transaction ends and returns it, read under
  * the lock (undefined when there is no such signup, or it is soft-deleted,
  * including by a delete that committed while this waited: Postgres checks the
  * row again once the delete's lock is released). Every service that
- * rewrites a signup's settings, changes its fields, or adds, edits or reorders
- * its slots takes this first, so they run one at a time per signup.
+ * rewrites a signup's settings or status, changes its fields, or adds, edits
+ * or reorders its slots takes this first, so they run one at a time per signup.
+ * A publish then locks the signup's slots too (`lockSlotsForSignup`), so it
+ * counts them after any `deleteSlot` already holding one has finished.
  *
  * `for no key update`, not `for update`: someone signing up (`commitToSlot`)
  * holds their slot row and then inserts a commitment whose signup_id foreign
@@ -60,13 +121,14 @@ export async function readLiveSignup(db: Queryable, signupId: string) {
  * anchor as they stand. The services that hold one slot row without it
  * (`commitToSlot`, a participant's quantity change in
  * `updateOwnCommitment`, and `deleteSlot`) never take it afterwards.
+ * Commitment rows come after the slot's (see `updateOwnCommitment`); a
+ * service that locks only a commitment (`cancelOwnCommitment`,
+ * `removeCommitment`) takes neither lock after it.
  *
  * `tx` is a transaction, not `Queryable`: on the pool handle the lock would be
  * gone as soon as the select's own autocommit ended. `workspaceId` is the one
  * the caller passed to `requireWorkspaceWrite`, so the row is scoped to the
- * workspace the actor was cleared for, like every other tenant-table query
- * (null, which the guard lets through as guest scope, matches only a signup
- * with no workspace).
+ * workspace the actor was cleared for, like every other tenant-table query.
  */
 export async function lockSignupForWrite(tx: Tx, signupId: string, workspaceId: string | null) {
   const [row] = await tx
@@ -85,6 +147,13 @@ export async function lockSignupForWrite(tx: Tx, signupId: string, workspaceId: 
 }
 
 /**
+ * The order a signup's slots are shown in, everywhere: the organizer view, the
+ * public page and the MCP tools. `lockSlotsForSignup` locks in this order too,
+ * so an insert before a given slot finds the same neighbours people see.
+ */
+export const SLOT_DISPLAY_ORDER = [asc(slots.sortOrder), asc(slots.slotAt), asc(slots.createdAt)];
+
+/**
  * A signup's slots in the order they are shown, with every row locked until
  * the transaction ends. Take the signup row lock first (`lockSignupForWrite`):
  * `commitToSlot` and `deleteSlot` hold one slot row and then key-share the
@@ -98,7 +167,7 @@ export async function lockSlotsForSignup(tx: Tx, signupId: string, workspaceId: 
     .select()
     .from(slots)
     .where(and(eq(slots.signupId, signupId), inWorkspace(slots.workspaceId, workspaceId)))
-    .orderBy(asc(slots.sortOrder), asc(slots.slotAt), asc(slots.createdAt))
+    .orderBy(...SLOT_DISPLAY_ORDER)
     .for('update');
 }
 

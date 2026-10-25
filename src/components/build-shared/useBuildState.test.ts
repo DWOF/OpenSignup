@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
 import { buildReducer, useBuildState } from './useBuildState';
-import type { BuildState, BuildField, BuildRow } from './useBuildState';
+import type { BuildState, BuildField, BuildRow, BuildSlot } from './useBuildState';
 import type { SlotFieldDefinition } from '@/schemas/slot-fields';
 import type { SignupSettings } from '@/schemas/signups';
 
@@ -34,46 +34,8 @@ const makeState = (overrides: Partial<BuildState> = {}): BuildState => ({
   rows: [],
   groupByFieldRef: null,
   reminderFieldRef: null,
-  previewRowIdx: 0,
-  showPreview: false,
   saveStatus: { kind: 'idle' },
   ...overrides,
-});
-
-// ---------------------------------------------------------------------------
-// SET_FIELD_WIDTH
-// ---------------------------------------------------------------------------
-
-describe('buildReducer SET_FIELD_WIDTH', () => {
-  it('sets width on the correct field', () => {
-    const field1 = makeField({ id: 'f1', ref: 'alpha' });
-    const field2 = makeField({ id: 'f2', ref: 'beta' });
-    const state = makeState({ fields: [field1, field2] });
-
-    const next = buildReducer(state, { type: 'SET_FIELD_WIDTH', fieldId: 'f1', width: 300 });
-
-    expect(next.fields[0]?.width).toBe(300);
-    expect(next.fields[1]?.width).toBeUndefined();
-  });
-
-  it('does not mutate other fields', () => {
-    const field1 = makeField({ id: 'f1' });
-    const field2 = makeField({ id: 'f2', name: 'Other', ref: 'other' });
-    const state = makeState({ fields: [field1, field2] });
-
-    const next = buildReducer(state, { type: 'SET_FIELD_WIDTH', fieldId: 'f1', width: 200 });
-
-    expect(next.fields[1]).toEqual(field2);
-  });
-
-  it('clears width when undefined is passed', () => {
-    const field = makeField({ id: 'f1', width: 300 });
-    const state = makeState({ fields: [field] });
-
-    const next = buildReducer(state, { type: 'SET_FIELD_WIDTH', fieldId: 'f1', width: undefined });
-
-    expect(next.fields[0]?.width).toBeUndefined();
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -102,6 +64,33 @@ describe('buildReducer OPTIMISTIC_ADD_ROW', () => {
     });
 
     expect(next.rows[0]).toEqual(row1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INSERT_ROW_AFTER
+// ---------------------------------------------------------------------------
+
+describe('buildReducer INSERT_ROW_AFTER', () => {
+  const rows = ['r1', 'r2', 'r3'].map((id, i) => makeRow({ id, sortOrder: i }));
+
+  it('puts the row straight after the named row and renumbers from 0', () => {
+    const next = buildReducer(makeState({ rows }), {
+      type: 'INSERT_ROW_AFTER',
+      afterRowId: 'r1',
+      row: makeRow({ id: 'new', sortOrder: 99 }),
+    });
+    expect(next.rows.map((r) => r.id)).toEqual(['r1', 'new', 'r2', 'r3']);
+    expect(next.rows.map((r) => r.sortOrder)).toEqual([0, 1, 2, 3]);
+  });
+
+  it('appends when the named row is gone', () => {
+    const next = buildReducer(makeState({ rows }), {
+      type: 'INSERT_ROW_AFTER',
+      afterRowId: 'missing',
+      row: makeRow({ id: 'new' }),
+    });
+    expect(next.rows.map((r) => r.id)).toEqual(['r1', 'r2', 'r3', 'new']);
   });
 });
 
@@ -138,39 +127,6 @@ describe('buildReducer OPTIMISTIC_REMOVE_ROW', () => {
     const next = buildReducer(state, { type: 'OPTIMISTIC_REMOVE_ROW', rowId: 'r1' });
 
     expect(next.rows).toHaveLength(0);
-  });
-
-  it('clamps previewRowIdx when the highlighted row is deleted', () => {
-    const row1 = makeRow({ id: 'r1' });
-    const row2 = makeRow({ id: 'r2' });
-    const state = makeState({ rows: [row1, row2], previewRowIdx: 1 });
-
-    const next = buildReducer(state, { type: 'OPTIMISTIC_REMOVE_ROW', rowId: 'r2' });
-
-    expect(next.rows).toHaveLength(1);
-    expect(next.previewRowIdx).toBe(0);
-  });
-
-  it('clamps previewRowIdx to 0 when all rows are deleted', () => {
-    const row1 = makeRow({ id: 'r1' });
-    const state = makeState({ rows: [row1], previewRowIdx: 0 });
-
-    const next = buildReducer(state, { type: 'OPTIMISTIC_REMOVE_ROW', rowId: 'r1' });
-
-    expect(next.rows).toHaveLength(0);
-    expect(next.previewRowIdx).toBe(0);
-  });
-
-  it('clamps previewRowIdx when deletion shrinks the list below the current index', () => {
-    const row1 = makeRow({ id: 'r1' });
-    const row2 = makeRow({ id: 'r2' });
-    const row3 = makeRow({ id: 'r3' });
-    const state = makeState({ rows: [row1, row2, row3], previewRowIdx: 2 });
-
-    const next = buildReducer(state, { type: 'OPTIMISTIC_REMOVE_ROW', rowId: 'r1' });
-
-    expect(next.rows).toHaveLength(2);
-    expect(next.previewRowIdx).toBe(1);
   });
 });
 
@@ -235,7 +191,11 @@ describe('buildReducer OPTIMISTIC_SET_CAPACITY', () => {
     const row2 = makeRow({ id: 'r2', capacity: 5 });
     const state = makeState({ rows: [row1, row2] });
 
-    const next = buildReducer(state, { type: 'OPTIMISTIC_SET_CAPACITY', rowId: 'r1', capacity: 10 });
+    const next = buildReducer(state, {
+      type: 'OPTIMISTIC_SET_CAPACITY',
+      rowId: 'r1',
+      capacity: 10,
+    });
 
     expect(next.rows[0]?.capacity).toBe(10);
     expect(next.rows[1]?.capacity).toBe(5);
@@ -245,7 +205,11 @@ describe('buildReducer OPTIMISTIC_SET_CAPACITY', () => {
     const row = makeRow({ id: 'r1', capacity: 10 });
     const state = makeState({ rows: [row] });
 
-    const next = buildReducer(state, { type: 'OPTIMISTIC_SET_CAPACITY', rowId: 'r1', capacity: null });
+    const next = buildReducer(state, {
+      type: 'OPTIMISTIC_SET_CAPACITY',
+      rowId: 'r1',
+      capacity: null,
+    });
 
     expect(next.rows[0]?.capacity).toBeNull();
   });
@@ -274,31 +238,17 @@ describe('buildReducer SET_SAVE_STATUS', () => {
       type: 'SET_SAVE_STATUS',
       status: { kind: 'error', code: 'conflict', message: 'Reload to see latest.' },
     });
-    expect(next.saveStatus).toEqual({ kind: 'error', code: 'conflict', message: 'Reload to see latest.' });
+    expect(next.saveStatus).toEqual({
+      kind: 'error',
+      code: 'conflict',
+      message: 'Reload to see latest.',
+    });
   });
 
   it('updates saveStatus back to idle', () => {
     const state = makeState({ saveStatus: { kind: 'saved' } });
     const next = buildReducer(state, { type: 'SET_SAVE_STATUS', status: { kind: 'idle' } });
     expect(next.saveStatus).toEqual({ kind: 'idle' });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// SET_SHOW_PREVIEW
-// ---------------------------------------------------------------------------
-
-describe('buildReducer SET_SHOW_PREVIEW', () => {
-  it('sets showPreview to true', () => {
-    const state = makeState({ showPreview: false });
-    const next = buildReducer(state, { type: 'SET_SHOW_PREVIEW', show: true });
-    expect(next.showPreview).toBe(true);
-  });
-
-  it('sets showPreview to false', () => {
-    const state = makeState({ showPreview: true });
-    const next = buildReducer(state, { type: 'SET_SHOW_PREVIEW', show: false });
-    expect(next.showPreview).toBe(false);
   });
 });
 
@@ -561,7 +511,7 @@ describe('useBuildState moveField', () => {
     expect(result.current.state.saveStatus.kind).toBe('saved');
   });
 
-  it('refetches server truth on PATCH failure and preserves session widths', async () => {
+  it('refetches server truth on PATCH failure', async () => {
     const a = makeApiField({ id: 'a', ref: 'a', label: 'A', sortOrder: 0 });
     const b = makeApiField({ id: 'b', ref: 'b', label: 'B', sortOrder: 1 });
     const c = makeApiField({ id: 'c', ref: 'c', label: 'C', sortOrder: 2 });
@@ -585,13 +535,6 @@ describe('useBuildState moveField', () => {
 
     const { result } = renderBuild([a, b, c]);
 
-    // Set a session-only width on field "a" before the failing reorder so we can
-    // verify it survives the refetch.
-    act(() => {
-      result.current.setFieldWidth('a', 321);
-    });
-    expect(result.current.state.fields.find((f) => f.id === 'a')?.width).toBe(321);
-
     await act(async () => {
       await result.current.moveField('c', 0);
     });
@@ -605,7 +548,6 @@ describe('useBuildState moveField', () => {
     expect(patchCalls.length).toBe(2); // aborted after the failing second PATCH
     expect(getCalls.length).toBe(1); // single refetch
     expect(result.current.state.fields.map((f) => f.id)).toEqual(['a', 'b', 'c']);
-    expect(result.current.state.fields.find((f) => f.id === 'a')?.width).toBe(321);
     expect(result.current.state.saveStatus.kind).toBe('error');
   });
 
@@ -715,21 +657,8 @@ describe('useBuildState moveField', () => {
 // useBuildState moveRow (renderHook + mocked fetch)
 // ---------------------------------------------------------------------------
 
-interface InitialRowInput {
-  id: string;
-  capacity: number | null;
-  sortOrder?: number;
-  values: Record<string, unknown>;
-}
-
-function rowIdFromUrl(url: string): string | undefined {
-  return url.match(/\/api\/slots\/([^/]+)$/)?.[1];
-}
-
-function renderBuildWith(initialRows: InitialRowInput[]) {
-  return renderHook(() =>
-    useBuildState('sig_test', [], initialRows, defaultSettings),
-  );
+function renderBuildWith(initialRows: BuildSlot[]) {
+  return renderHook(() => useBuildState('sig_test', [], initialRows, defaultSettings));
 }
 
 describe('useBuildState moveRow', () => {
@@ -737,12 +666,12 @@ describe('useBuildState moveRow', () => {
     vi.unstubAllGlobals();
   });
 
-  it('reorders rows and PATCHes each changed row with its new sortOrder', async () => {
-    const r1: InitialRowInput = { id: 'r1', capacity: null, sortOrder: 0, values: {} };
-    const r2: InitialRowInput = { id: 'r2', capacity: null, sortOrder: 1, values: {} };
-    const r3: InitialRowInput = { id: 'r3', capacity: null, sortOrder: 2, values: {} };
+  it('sends the whole new order in one request', async () => {
+    const r1: BuildSlot = { id: 'r1', capacity: null, sortOrder: 0, values: {} };
+    const r2: BuildSlot = { id: 'r2', capacity: null, sortOrder: 1, values: {} };
+    const r3: BuildSlot = { id: 'r3', capacity: null, sortOrder: 2, values: {} };
 
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ data: {} }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ data: [] }));
     vi.stubGlobal('fetch', fetchMock);
 
     const { result } = renderBuildWith([r1, r2, r3]);
@@ -753,35 +682,38 @@ describe('useBuildState moveRow', () => {
     expect(result.current.state.rows.map((r) => r.id)).toEqual(['r3', 'r1', 'r2']);
     expect(result.current.state.rows.map((r) => r.sortOrder)).toEqual([0, 1, 2]);
 
-    const sentPatches = new Map<string, number>();
-    for (const call of fetchMock.mock.calls) {
-      const url = String(call[0]);
-      const init = call[1] as RequestInit | undefined;
-      if (init?.method !== 'PATCH') continue;
-      const id = rowIdFromUrl(url);
-      const body = JSON.parse(String(init.body)) as { sortOrder: number };
-      if (id !== undefined) sentPatches.set(id, body.sortOrder);
-    }
-    expect(sentPatches.get('r3')).toBe(0);
-    expect(sentPatches.get('r1')).toBe(1);
-    expect(sentPatches.get('r2')).toBe(2);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/signups/sig_test/slots/order');
+    expect(init.method).toBe('PUT');
+    expect(JSON.parse(String(init.body))).toEqual({ slotIds: ['r3', 'r1', 'r2'] });
     expect(result.current.state.saveStatus.kind).toBe('saved');
   });
 
-  it('refetches server truth on PATCH failure', async () => {
-    const r1: InitialRowInput = { id: 'r1', capacity: null, sortOrder: 0, values: { notes: 'one' } };
-    const r2: InitialRowInput = { id: 'r2', capacity: null, sortOrder: 1, values: { notes: 'two' } };
+  it('refetches server truth when the reorder is refused', async () => {
+    const r1: BuildSlot = { id: 'r1', capacity: null, sortOrder: 0, values: { notes: 'one' } };
+    const r2: BuildSlot = { id: 'r2', capacity: null, sortOrder: 1, values: { notes: 'two' } };
 
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (init?.method === 'PATCH') {
-        return jsonResponse({}, { ok: false });
+      if (init?.method === 'PUT') {
+        // Another tab added a slot, so this tab's list is missing one.
+        return jsonResponse(
+          {
+            error: {
+              code: 'invalid_input',
+              message: 'slotIds must list every slot of the signup exactly once',
+            },
+          },
+          { ok: false },
+        );
       }
       if (url.endsWith('/slots')) {
         return jsonResponse({
           data: [
             { id: 'r1', capacity: null, sortOrder: 0, values: { notes: 'one' } },
             { id: 'r2', capacity: null, sortOrder: 1, values: { notes: 'two' } },
+            { id: 'r3', capacity: null, sortOrder: 2, values: { notes: 'three' } },
           ],
         });
       }
@@ -794,17 +726,18 @@ describe('useBuildState moveRow', () => {
       await result.current.moveRow(0, 1);
     });
 
-    const getCalls = fetchMock.mock.calls.filter(
-      (c) => (c[1] as RequestInit | undefined)?.method !== 'PATCH',
-    );
-    expect(getCalls.length).toBe(1);
-    expect(result.current.state.rows.map((r) => r.id)).toEqual(['r1', 'r2']);
-    expect(result.current.state.saveStatus.kind).toBe('error');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.current.state.rows.map((r) => r.id)).toEqual(['r1', 'r2', 'r3']);
+    expect(result.current.state.saveStatus).toEqual({
+      kind: 'error',
+      code: 'invalid_input',
+      message: "The slots changed in another window, so your move wasn't saved. Drag it again.",
+    });
   });
 
   it('falls back to snapshot when refetch also fails', async () => {
-    const r1: InitialRowInput = { id: 'r1', capacity: null, sortOrder: 0, values: {} };
-    const r2: InitialRowInput = { id: 'r2', capacity: null, sortOrder: 1, values: {} };
+    const r1: BuildSlot = { id: 'r1', capacity: null, sortOrder: 0, values: {} };
+    const r2: BuildSlot = { id: 'r2', capacity: null, sortOrder: 1, values: {} };
 
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}, { ok: false }));
     vi.stubGlobal('fetch', fetchMock);
@@ -819,8 +752,8 @@ describe('useBuildState moveRow', () => {
   });
 
   it('is a no-op when fromIdx clamps to toIdx or is out of bounds', async () => {
-    const r1: InitialRowInput = { id: 'r1', capacity: null, sortOrder: 0, values: {} };
-    const r2: InitialRowInput = { id: 'r2', capacity: null, sortOrder: 1, values: {} };
+    const r1: BuildSlot = { id: 'r1', capacity: null, sortOrder: 0, values: {} };
+    const r2: BuildSlot = { id: 'r2', capacity: null, sortOrder: 1, values: {} };
 
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
@@ -842,39 +775,153 @@ describe('useBuildState moveRow', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// useBuildState mount-time showPreview default (viewport-aware)
-// ---------------------------------------------------------------------------
-
-function stubMatchMedia(matches: boolean) {
-  const mql = {
-    matches,
-    media: '',
-    onchange: null,
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-    addListener: () => {},
-    removeListener: () => {},
-  };
-  vi.stubGlobal('matchMedia', vi.fn(() => mql));
-}
-
-describe('useBuildState mount-time showPreview default', () => {
+describe('useBuildState moveRow into another group', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
-  it('defaults showPreview to true when viewport is ≥1280px', () => {
-    stubMatchMedia(true);
-    const { result } = renderBuild([]);
-    expect(result.current.state.showPreview).toBe(true);
+  const dateField = makeApiField({
+    id: 'f-date',
+    ref: 'date',
+    label: 'Date',
+    fieldType: 'date',
+    config: { fieldType: 'date' },
+  });
+  const a: BuildSlot = { id: 'a', capacity: 1, sortOrder: 0, values: { date: '2026-11-01' } };
+  const b: BuildSlot = { id: 'b', capacity: 1, sortOrder: 1, values: { date: '2026-11-02' } };
+  const c: BuildSlot = { id: 'c', capacity: 1, sortOrder: 2, values: { date: '2026-11-02' } };
+
+  function renderGrouped() {
+    return renderHook(() =>
+      useBuildState('sig_test', [dateField], [a, b, c], {
+        ...defaultSettings,
+        groupByFieldRefs: ['date'],
+      }),
+    );
+  }
+
+  it('keeps the new group value on screen and on the server, and saves the new order', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ data: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderGrouped();
+    await act(async () => {
+      await result.current.moveRow(0, 1, { fieldRef: 'date', value: '2026-11-02' });
+    });
+    expect(result.current.state.saveStatus.kind).toBe('saved');
+    // Any debounced save would land by now.
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    expect(result.current.state.rows.map((r) => r.id)).toEqual(['b', 'a', 'c']);
+    expect(result.current.state.rows.find((r) => r.id === 'a')?.values['date']).toBe('2026-11-02');
+
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    const orderPut = calls.find(
+      ([url, init]) => url === '/api/signups/sig_test/slots/order' && init.method === 'PUT',
+    );
+    expect(JSON.parse(String(orderPut?.[1].body))).toEqual({ slotIds: ['b', 'a', 'c'] });
+    const patches = calls.filter(
+      ([url, init]) => url === '/api/slots/a' && init.method === 'PATCH',
+    );
+    expect(patches.length).toBeGreaterThan(0);
+    for (const [, init] of patches) {
+      expect(JSON.parse(String(init.body))).toEqual({ values: { date: '2026-11-02' } });
+    }
   });
 
-  it('leaves showPreview false when viewport is <1280px', () => {
-    stubMatchMedia(false);
-    const { result } = renderBuild([]);
-    expect(result.current.state.showPreview).toBe(false);
+  it('saves the value alone when the drop leaves the slot at the same index', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ data: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderGrouped();
+    await act(async () => {
+      await result.current.moveRow(0, 0, { fieldRef: 'date', value: '' });
+    });
+
+    expect(result.current.state.rows.map((r) => r.id)).toEqual(['a', 'b', 'c']);
+    expect(result.current.state.rows[0]?.values['date']).toBe('');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/slots/a');
+    expect(JSON.parse(String(init.body))).toEqual({ values: { date: '' } });
+  });
+
+  it('shows the stale-reorder message and the server rows when the order is refused', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'PATCH') return jsonResponse({ data: {} });
+      if (init?.method === 'PUT') {
+        return jsonResponse(
+          {
+            error: {
+              code: 'invalid_input',
+              message: 'slotIds must list every slot of the signup exactly once',
+            },
+          },
+          { ok: false },
+        );
+      }
+      if (url.endsWith('/slots')) {
+        // The value saved, the order didn't, and another tab added a slot.
+        return jsonResponse({
+          data: [
+            { ...a, values: { date: '2026-11-02' } },
+            b,
+            c,
+            { id: 'd', capacity: 1, sortOrder: 3, values: { date: '2026-11-03' } },
+          ],
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderGrouped();
+    await act(async () => {
+      await result.current.moveRow(0, 1, { fieldRef: 'date', value: '2026-11-02' });
+    });
+
+    expect(result.current.state.rows.map((r) => r.id)).toEqual(['a', 'b', 'c', 'd']);
+    expect(result.current.state.rows[0]?.values['date']).toBe('2026-11-02');
+    expect(result.current.state.saveStatus).toEqual({
+      kind: 'error',
+      code: 'invalid_input',
+      message: "The slots changed in another window, so your move wasn't saved. Drag it again.",
+    });
+  });
+
+  it('shows the server rows when the value save is refused, and sends no order', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'PATCH') {
+        return jsonResponse(
+          { error: { code: 'not_found', message: 'Slot not found' } },
+          { status: 404 },
+        );
+      }
+      if (url.endsWith('/slots')) return jsonResponse({ data: [b, c] });
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderGrouped();
+    await act(async () => {
+      await result.current.moveRow(0, 1, { fieldRef: 'date', value: '2026-11-02' });
+    });
+
+    expect(
+      fetchMock.mock.calls.some((call) => (call[1] as RequestInit | undefined)?.method === 'PUT'),
+    ).toBe(false);
+    expect(result.current.state.rows.map((r) => r.id)).toEqual(['b', 'c']);
+    expect(result.current.state.saveStatus).toEqual({
+      kind: 'error',
+      code: 'not_found',
+      message: 'Slot not found',
+    });
   });
 });
 
@@ -887,17 +934,29 @@ describe('useBuildState duplicateRow', () => {
     vi.unstubAllGlobals();
   });
 
-  it('POSTs the source values + capacity to /api/signups/[id]/slots', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse({ data: { id: 'new', capacity: 3, sortOrder: 99, values: {} } }),
-    );
+  const duplicateFields = [
+    makeApiField({ id: 'f1', ref: 'name', label: 'Name' }),
+    makeApiField({
+      id: 'f2',
+      ref: 'qty',
+      label: 'Qty',
+      fieldType: 'number',
+      sortOrder: 1,
+      config: { fieldType: 'number' },
+    }),
+  ];
+
+  const copyResponse = (row: Partial<BuildSlot> = {}) =>
+    jsonResponse({ data: [{ id: 'new', capacity: 3, sortOrder: 99, values: {}, ...row }] }, { status: 201 });
+
+  const duplicateBody = async (values: Record<string, unknown>) => {
+    const fetchMock = vi.fn().mockResolvedValue(copyResponse());
     vi.stubGlobal('fetch', fetchMock);
-    // Inject an initial row by seeding via the hook.
     const { result } = renderHook(() =>
       useBuildState(
         'sig_test',
-        [],
-        [{ id: 'src', capacity: 3, sortOrder: 0, values: { name: 'Jane' } }],
+        duplicateFields,
+        [{ id: 'src', capacity: 3, sortOrder: 0, values }],
         defaultSettings,
       ),
     );
@@ -906,30 +965,41 @@ describe('useBuildState duplicateRow', () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0]!;
-    expect(String(url)).toBe('/api/signups/sig_test/slots');
+    expect(String(url)).toBe('/api/signups/sig_test/slots/bulk');
     expect((init as RequestInit).method).toBe('POST');
     const body = JSON.parse(String((init as RequestInit).body)) as {
-      values: Record<string, string>;
-      capacity: number;
+      rows: { values: Record<string, unknown>; capacity: number }[];
+      beforeSlotId?: string;
     };
-    expect(body.values).toEqual({ name: 'Jane' });
+    expect(body.rows).toHaveLength(1);
+    return body.rows[0]!;
+  };
+
+  it('POSTs the source values, typed by field, and capacity to the bulk route', async () => {
+    const body = await duplicateBody({ name: 'Jane', qty: 12 });
+    expect(body.values).toEqual({ name: 'Jane', qty: 12 });
     expect(body.capacity).toBe(3);
+  });
+
+  it('leaves an empty Number cell out of the body', async () => {
+    const body = await duplicateBody({ name: 'Jane', qty: null });
+    expect(body.values).toEqual({ name: 'Jane' });
   });
 
   it('is a no-op when the source row is missing', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}));
     vi.stubGlobal('fetch', fetchMock);
     const { result } = renderHook(() => useBuildState('sig_test', [], [], defaultSettings));
+    let copyId: string | null = 'unset';
     await act(async () => {
-      await result.current.duplicateRow('does-not-exist');
+      copyId = await result.current.duplicateRow('does-not-exist');
     });
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(copyId).toBeNull();
   });
 
   it('falls back capacity to 1 when source had null capacity', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse({ data: { id: 'new', capacity: 1, sortOrder: 99, values: {} } }),
-    );
+    const fetchMock = vi.fn().mockResolvedValue(copyResponse({ capacity: 1 }));
     vi.stubGlobal('fetch', fetchMock);
     const { result } = renderHook(() =>
       useBuildState(
@@ -943,9 +1013,69 @@ describe('useBuildState duplicateRow', () => {
       await result.current.duplicateRow('src');
     });
     const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body)) as {
-      capacity: number;
+      rows: { capacity: number }[];
     };
-    expect(body.capacity).toBe(1);
+    expect(body.rows[0]!.capacity).toBe(1);
+  });
+
+  const fourSlots: BuildSlot[] = ['a', 'b', 'c', 'd'].map((id, i) => ({
+    id,
+    capacity: 1,
+    sortOrder: i,
+    values: {},
+  }));
+
+  it('puts the copy of the second of four slots third, in front of the slot after it', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(copyResponse({ id: 'copy', sortOrder: 2 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() => useBuildState('sig_test', [], fourSlots, defaultSettings));
+    let copyId: string | null = null;
+    await act(async () => {
+      copyId = await result.current.duplicateRow('b');
+    });
+    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body)) as {
+      beforeSlotId?: string;
+    };
+    expect(body.beforeSlotId).toBe('c');
+    expect(copyId).toBe('copy');
+    expect(result.current.state.rows.map((r) => r.id)).toEqual(['a', 'b', 'copy', 'c', 'd']);
+    expect(result.current.state.rows.map((r) => r.sortOrder)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('sends no beforeSlotId when the source is the last slot, and adds the copy at the end', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(copyResponse({ id: 'copy', sortOrder: 4 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() => useBuildState('sig_test', [], fourSlots, defaultSettings));
+    await act(async () => {
+      await result.current.duplicateRow('d');
+    });
+    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body)) as Record<
+      string,
+      unknown
+    >;
+    expect('beforeSlotId' in body).toBe(false);
+    expect(result.current.state.rows.map((r) => r.id)).toEqual(['a', 'b', 'c', 'd', 'copy']);
+  });
+
+  it('resolves to null and shows the error when the server refuses the copy', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ error: { code: 'forbidden', message: 'No edit access' } }, { status: 403 }),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() => useBuildState('sig_test', [], fourSlots, defaultSettings));
+    let copyId: string | null = 'unset';
+    await act(async () => {
+      copyId = await result.current.duplicateRow('b');
+    });
+    expect(copyId).toBeNull();
+    expect(result.current.state.rows.map((r) => r.id)).toEqual(['a', 'b', 'c', 'd']);
+    expect(result.current.state.saveStatus).toEqual({
+      kind: 'error',
+      code: 'forbidden',
+      message: 'No edit access',
+    });
   });
 });
 
@@ -963,20 +1093,29 @@ describe('buildReducer OPTIMISTIC_UPDATE_META', () => {
 
   it('updates description when patch carries a description', () => {
     const state = makeState({ title: 'T', description: 'old' });
-    const next = buildReducer(state, { type: 'OPTIMISTIC_UPDATE_META', patch: { description: 'new' } });
+    const next = buildReducer(state, {
+      type: 'OPTIMISTIC_UPDATE_META',
+      patch: { description: 'new' },
+    });
     expect(next.title).toBe('T');
     expect(next.description).toBe('new');
   });
 
   it('preserves the other field when only one is patched', () => {
     const state = makeState({ title: 'keep me', description: 'replace me' });
-    const next = buildReducer(state, { type: 'OPTIMISTIC_UPDATE_META', patch: { description: 'replaced' } });
+    const next = buildReducer(state, {
+      type: 'OPTIMISTIC_UPDATE_META',
+      patch: { description: 'replaced' },
+    });
     expect(next.title).toBe('keep me');
   });
 
   it('allows clearing description to empty string', () => {
     const state = makeState({ title: 'T', description: 'present' });
-    const next = buildReducer(state, { type: 'OPTIMISTIC_UPDATE_META', patch: { description: '' } });
+    const next = buildReducer(state, {
+      type: 'OPTIMISTIC_UPDATE_META',
+      patch: { description: '' },
+    });
     expect(next.description).toBe('');
   });
 });
@@ -986,9 +1125,7 @@ describe('buildReducer OPTIMISTIC_UPDATE_META', () => {
 // ---------------------------------------------------------------------------
 
 function renderBuildWithMeta(meta: { title: string; description: string | null }) {
-  return renderHook(() =>
-    useBuildState('sig_test', [], [], defaultSettings, meta),
-  );
+  return renderHook(() => useBuildState('sig_test', [], [], defaultSettings, meta));
 }
 
 describe('useBuildState updateSignupMeta', () => {
@@ -1023,7 +1160,10 @@ describe('useBuildState updateSignupMeta', () => {
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(String(url)).toBe('/api/signups/sig_test');
     expect((init as RequestInit).method).toBe('PATCH');
-    const body = JSON.parse(String((init as RequestInit).body)) as { title?: string; description?: string };
+    const body = JSON.parse(String((init as RequestInit).body)) as {
+      title?: string;
+      description?: string;
+    };
     expect(body.title).toBe('New');
     expect(body.description).toBeUndefined();
   });
@@ -1042,7 +1182,9 @@ describe('useBuildState updateSignupMeta', () => {
       await vi.advanceTimersByTimeAsync(900);
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body)) as { title?: string };
+    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body)) as {
+      title?: string;
+    };
     expect(body.title).toBe('ABC');
   });
 
@@ -1108,12 +1250,14 @@ describe('useBuildState updateSignupMeta', () => {
 
   it('marks saveStatus error with the server error code when PATCH fails', async () => {
     vi.useFakeTimers();
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse(
-        { error: { code: 'conflict', message: 'Stale snapshot' } },
-        { ok: false, status: 409 },
-      ),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { error: { code: 'conflict', message: 'Stale snapshot' } },
+          { ok: false, status: 409 },
+        ),
+      );
     vi.stubGlobal('fetch', fetchMock);
     const { result } = renderBuildWithMeta({ title: 'Old', description: '' });
     act(() => {
@@ -1215,7 +1359,9 @@ describe('useBuildState setReminderField', () => {
       (c) => String(c[0]) === '/api/signups/sig_test' && (c[1] as RequestInit).method === 'PATCH',
     );
     expect(patches).toHaveLength(1);
-    const body = JSON.parse(String((patches[0]![1] as RequestInit).body)) as { settings: Partial<SignupSettings> };
+    const body = JSON.parse(String((patches[0]![1] as RequestInit).body)) as {
+      settings: Partial<SignupSettings>;
+    };
     return body.settings;
   }
 
@@ -1257,7 +1403,10 @@ describe('useBuildState setReminderField', () => {
 
     // Only what changed: the service merges it, so a setting changed in
     // another tab or by an assistant since the page opened is left alone.
-    expect(settingsPatchBody(fetchMock)).toEqual({ sendReminders: true, reminderFromFieldRef: 'date' });
+    expect(settingsPatchBody(fetchMock)).toEqual({
+      sendReminders: true,
+      reminderFromFieldRef: 'date',
+    });
     expect(result.current.state.reminderFieldRef).toBe('date');
     expect(result.current.state.groupByFieldRef).toBe('what');
     expect(result.current.state.saveStatus.kind).toBe('saved');
@@ -1288,7 +1437,10 @@ describe('useBuildState setReminderField', () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValue(
-        jsonResponse({ error: { code: 'invalid_input', message: 'not a date field' } }, { status: 400 }),
+        jsonResponse(
+          { error: { code: 'invalid_input', message: 'not a date field' } },
+          { status: 400 },
+        ),
       );
     vi.stubGlobal('fetch', fetchMock);
     const { result } = renderHook(() =>
@@ -1371,7 +1523,10 @@ describe('useBuildState setReminderField', () => {
     await act(async () => {
       await result.current.setReminderField('setup-day');
     });
-    expect(settingsPatchBody(fetchMock)).toEqual({ sendReminders: true, reminderFromFieldRef: 'setup-day' });
+    expect(settingsPatchBody(fetchMock)).toEqual({
+      sendReminders: true,
+      reminderFromFieldRef: 'setup-day',
+    });
     expect(result.current.state.reminderFieldRef).toBe('setup-day');
   });
 
@@ -1419,10 +1574,18 @@ describe('useBuildState setGroupBy', () => {
     config: { fieldType: 'date' },
   });
 
-  function settingsPatchBodies(fetchMock: ReturnType<typeof vi.fn>): Array<Partial<SignupSettings>> {
+  function settingsPatchBodies(
+    fetchMock: ReturnType<typeof vi.fn>,
+  ): Array<Partial<SignupSettings>> {
     return fetchMock.mock.calls
-      .filter((c) => String(c[0]) === '/api/signups/sig_test' && (c[1] as RequestInit).method === 'PATCH')
-      .map((c) => (JSON.parse(String((c[1] as RequestInit).body)) as { settings: Partial<SignupSettings> }).settings);
+      .filter(
+        (c) => String(c[0]) === '/api/signups/sig_test' && (c[1] as RequestInit).method === 'PATCH',
+      )
+      .map(
+        (c) =>
+          (JSON.parse(String((c[1] as RequestInit).body)) as { settings: Partial<SignupSettings> })
+            .settings,
+      );
   }
 
   it('PATCHes only groupByFieldRefs, so settings changed elsewhere since the page opened survive', async () => {
@@ -1440,7 +1603,10 @@ describe('useBuildState setGroupBy', () => {
       await result.current.setGroupBy(null);
     });
 
-    expect(settingsPatchBodies(fetchMock)).toEqual([{ groupByFieldRefs: ['what'] }, { groupByFieldRefs: [] }]);
+    expect(settingsPatchBodies(fetchMock)).toEqual([
+      { groupByFieldRefs: ['what'] },
+      { groupByFieldRefs: [] },
+    ]);
     expect(result.current.state.groupByFieldRef).toBeNull();
     expect(result.current.state.saveStatus.kind).toBe('saved');
   });
@@ -1569,6 +1735,286 @@ describe('useBuildState setGroupBy', () => {
     ]);
     expect(result.current.state.groupByFieldRef).toBeNull();
     expect(result.current.state.reminderFieldRef).toBeNull();
+    expect(result.current.state.saveStatus.kind).toBe('saved');
+  });
+});
+
+describe('useBuildState settings naming a field this tab has not loaded', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const whatField = makeApiField({ id: 'f-what', ref: 'what', label: 'What', sortOrder: 0 });
+  const eventDay = makeApiField({
+    id: 'f-event',
+    ref: 'event-day',
+    label: 'Event day',
+    fieldType: 'date',
+    sortOrder: 1,
+    config: { fieldType: 'date' },
+  });
+  // An assistant added "Event day" and moved reminders to it after this tab
+  // opened, so the merged settings the PATCH returns name a field it lacks.
+  const saved: SignupSettings = {
+    ...defaultSettings,
+    sendReminders: true,
+    reminderFromFieldRef: 'event-day',
+    groupByFieldRefs: ['what'],
+  };
+
+  function routedFetch(fields: () => Response) {
+    return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === '/api/signups/sig_test/fields' && init?.method === 'GET') {
+        return Promise.resolve(fields());
+      }
+      return Promise.resolve(jsonResponse({ data: { id: 'sig_test', settings: saved } }));
+    });
+  }
+
+  it('fetches the field list, so the reminder field it adopts is one the tab can show', async () => {
+    const fetchMock = routedFetch(() => jsonResponse({ data: [whatField, eventDay] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() =>
+      useBuildState('sig_test', [whatField], [], defaultSettings),
+    );
+
+    await act(async () => {
+      await result.current.setGroupBy('what');
+    });
+
+    expect(result.current.state.fields.map((f) => f.ref)).toEqual(['what', 'event-day']);
+    expect(result.current.state.reminderFieldRef).toBe('event-day');
+    expect(result.current.state.groupByFieldRef).toBe('what');
+    expect(result.current.state.saveStatus.kind).toBe('saved');
+  });
+
+  it('does not fetch fields when every field the settings name is loaded', async () => {
+    const fetchMock = routedFetch(() => jsonResponse({ data: [whatField, eventDay] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() =>
+      useBuildState('sig_test', [whatField, eventDay], [], defaultSettings),
+    );
+
+    await act(async () => {
+      await result.current.setGroupBy('what');
+    });
+
+    const gets = fetchMock.mock.calls.filter((c) => c[1]?.method === 'GET');
+    expect(gets).toHaveLength(0);
+    expect(result.current.state.reminderFieldRef).toBe('event-day');
+  });
+
+  it('still shows the save as saved when the field fetch fails', async () => {
+    const fetchMock = routedFetch(() =>
+      jsonResponse({ error: { code: 'internal' } }, { status: 500 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() =>
+      useBuildState('sig_test', [whatField], [], defaultSettings),
+    );
+
+    await act(async () => {
+      await result.current.setGroupBy('what');
+    });
+
+    expect(result.current.state.fields.map((f) => f.ref)).toEqual(['what']);
+    expect(result.current.state.groupByFieldRef).toBe('what');
+    expect(result.current.state.saveStatus.kind).toBe('saved');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// useBuildState renameGroup
+// ---------------------------------------------------------------------------
+
+describe('useBuildState renameGroup', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const dateField = makeApiField({
+    id: 'f-date',
+    ref: 'date',
+    label: 'Date',
+    fieldType: 'date',
+    config: { fieldType: 'date' },
+  });
+  const slots: BuildSlot[] = [
+    { id: 'r1', capacity: null, sortOrder: 0, values: { date: '2026-11-14', item: 'Cups' } },
+    { id: 'r2', capacity: null, sortOrder: 1, values: { date: '2026-11-14', item: 'Plates' } },
+    { id: 'r3', capacity: null, sortOrder: 2, values: { date: '2026-11-15', item: 'Napkins' } },
+  ];
+
+  function renderGrouped() {
+    return renderHook(() => useBuildState('sig_test', [dateField], slots, defaultSettings));
+  }
+
+  it('saves every row in the group straight away, once each', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ data: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderGrouped();
+    let saved: boolean | undefined;
+    await act(async () => {
+      saved = await result.current.renameGroup('date', ['r1', 'r2'], '2026-11-21');
+    });
+
+    expect(saved).toBe(true);
+    expect(result.current.state.rows.map((r) => r.values['date'])).toEqual([
+      '2026-11-21',
+      '2026-11-21',
+      '2026-11-15',
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    expect(calls.map(([url]) => url)).toEqual(['/api/slots/r1', '/api/slots/r2']);
+    expect(calls.map(([, init]) => init.method)).toEqual(['PATCH', 'PATCH']);
+    expect(JSON.parse(String(calls[0]?.[1].body))).toEqual({
+      values: { date: '2026-11-21', item: 'Cups' },
+    });
+    expect(result.current.state.saveStatus.kind).toBe('saved');
+  });
+
+  it('puts the rows back to their saved value when the server refuses', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { error: { code: 'invalid_input', message: '"date" must be a real date as YYYY-MM-DD' } },
+          { ok: false, status: 400 },
+        ),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderGrouped();
+    let saved: boolean | undefined;
+    await act(async () => {
+      saved = await result.current.renameGroup('date', ['r1', 'r2'], 'Sat, Nov 21');
+    });
+
+    expect(saved).toBe(false);
+    expect(result.current.state.rows.map((r) => r.values['date'])).toEqual([
+      '2026-11-14',
+      '2026-11-14',
+      '2026-11-15',
+    ]);
+    expect(result.current.state.saveStatus.kind).toBe('error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// useBuildState editCell refused by the server (#514)
+// ---------------------------------------------------------------------------
+
+describe('useBuildState editCell when the server refuses a value', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  const itemField = makeApiField({ id: 'f-item', ref: 'item', label: 'Item' });
+  const noteField = makeApiField({ id: 'f-note', ref: 'note', label: 'Note', sortOrder: 1 });
+  const slot: BuildSlot = { id: 'r1', capacity: 2, sortOrder: 0, values: { item: 'Fruit', note: '' } };
+
+  // Refuses a slot PATCH whose values hold more than 200 characters, as the
+  // slot service does for a text field with the default maxLength.
+  function stubRefusingServer() {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { values?: Record<string, unknown> };
+      const tooLong = Object.values(body.values ?? {}).some((v) => typeof v === 'string' && v.length > 200);
+      return tooLong
+        ? jsonResponse({ error: { code: 'invalid_input', message: 'Too long' } }, { status: 400 })
+        : jsonResponse({ data: {} });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  function render() {
+    return renderHook(() => useBuildState('sig_test', [itemField, noteField], [slot], defaultSettings));
+  }
+
+  it('puts the last saved value back and keeps the error showing', async () => {
+    vi.useFakeTimers();
+    stubRefusingServer();
+    const { result } = render();
+
+    act(() => result.current.editCell('r1', 'item', 'x'.repeat(201)));
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    expect(result.current.state.rows[0]?.values['item']).toBe('Fruit');
+    expect(result.current.state.saveStatus).toEqual({ kind: 'error', code: 'invalid_input', message: 'Too long' });
+  });
+
+  it('lets a later edit to another field in the row save', async () => {
+    vi.useFakeTimers();
+    const fetchMock = stubRefusingServer();
+    const { result } = render();
+
+    act(() => result.current.editCell('r1', 'item', 'x'.repeat(201)));
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+    act(() => result.current.editCell('r1', 'note', 'Bring napkins'));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    const last = fetchMock.mock.calls.at(-1) as [string, RequestInit];
+    expect(JSON.parse(String(last[1].body))).toEqual({ values: { item: 'Fruit', note: 'Bring napkins' } });
+    expect(result.current.state.rows[0]?.values).toEqual({ item: 'Fruit', note: 'Bring napkins' });
+    expect(result.current.state.saveStatus.kind).toBe('saved');
+  });
+
+  it('rolls back from the last value that saved, not the one the page opened with', async () => {
+    vi.useFakeTimers();
+    stubRefusingServer();
+    const { result } = render();
+
+    act(() => result.current.editCell('r1', 'item', 'Orange slices'));
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+    act(() => result.current.editCell('r1', 'item', 'x'.repeat(201)));
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    expect(result.current.state.rows[0]?.values['item']).toBe('Orange slices');
+  });
+
+  it('keeps an edit made while the refused save was in flight', async () => {
+    vi.useFakeTimers();
+    let refuse: (res: Response) => void = () => {};
+    const fetchMock = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        String(init?.body).includes('x'.repeat(201))
+          ? new Promise<Response>((resolve) => {
+              refuse = resolve;
+            })
+          : Promise.resolve(jsonResponse({ data: {} })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = render();
+
+    act(() => result.current.editCell('r1', 'item', 'x'.repeat(201)));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    // The organizer types again in the same cell while the refused save is out.
+    act(() => result.current.editCell('r1', 'item', 'Juice boxes'));
+    await act(async () => {
+      refuse(jsonResponse({ error: { code: 'invalid_input', message: 'Too long' } }, { status: 400 }));
+      await Promise.resolve();
+    });
+    expect(result.current.state.rows[0]?.values['item']).toBe('Juice boxes');
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(result.current.state.rows[0]?.values['item']).toBe('Juice boxes');
     expect(result.current.state.saveStatus.kind).toBe('saved');
   });
 });

@@ -1,51 +1,66 @@
 import { and, asc, eq, sql } from 'drizzle-orm';
 import type { Db, Queryable, Tx } from '@/db/client';
 import { signups } from '@/db/schema/signups';
-import { slotFields } from '@/db/schema/slot-fields';
+import { slotFields, type SlotField as FieldRow } from '@/db/schema/slot-fields';
 import { slots } from '@/db/schema/slots';
 import { activityActor, recordActivity } from '@/lib/activity';
 import { serviceError, type ServiceError } from '@/lib/errors';
 import { makeId } from '@/lib/ids';
 import { parseInputSafe } from '@/lib/parse';
-import {
-  requireWorkspaceAccess,
-  requireWorkspaceWrite,
-  type Actor,
-} from '@/lib/policy';
+import { requireWorkspaceWrite, type Actor } from '@/lib/policy';
 import {
   findReminderFields,
+  isCalendarDate,
+  isRealDate,
   isRealTime,
-  pickAnchorRef,
+  MIN_DATE_YEAR,
   resolveAnchorRef,
   slotTimeOfDay,
 } from '@/lib/reminder-fields';
 import { err, ok, type Result } from '@/lib/result';
+import { MAX_SORT_ORDER } from '@/schemas/common';
 import {
-  MIN_DATE_YEAR,
+  TEXT_DEFAULT_MAX_LENGTH,
   type SlotFieldConfig,
   type SlotFieldDefinition,
   SlotFieldInputSchema,
+  SlotFieldReorderInputSchema,
   type SlotFieldUpdateInput,
   SlotFieldUpdateInputSchema,
 } from '@/schemas/slot-fields';
-import { lockSignupForWrite, lockSlotsForSignup, readLiveSignup } from './locks';
-
-type FieldRow = typeof slotFields.$inferSelect;
-
-// The pure resolution rules live in src/lib/reminder-fields.ts so the build
-// page can share them; re-exported here for the callers that already import
-// them alongside the field services.
-export { findReminderFields, pickAnchorRef };
+import type { StoredSignupSettings } from '@/schemas/signups';
+import {
+  getSignupRowForOrganizer,
+  lockSignupForWrite,
+  lockSlotsForSignup,
+  withSignupWriteLock,
+} from './locks';
 
 function rowToDefinition(row: FieldRow): SlotFieldDefinition {
   return {
     id: row.id,
     ref: row.ref,
     label: row.label,
-    fieldType: row.fieldType as SlotFieldDefinition['fieldType'],
+    fieldType: row.fieldType,
     sortOrder: row.sortOrder,
     config: row.config as SlotFieldConfig,
   };
+}
+
+/** One field row by id, unscoped: the caller judges the actor against its workspace next. */
+async function readField(q: Queryable, fieldId: string): Promise<FieldRow | undefined> {
+  const [row] = await q.select().from(slotFields).where(eq(slotFields.id, fieldId)).limit(1);
+  return row;
+}
+
+/**
+ * Whether a field belongs to the signup a route named. The field routes nest
+ * the field under a signup id; a field of another signup answers as not found,
+ * the same as one that doesn't exist. The MCP tools name the field alone and
+ * pass no signup id.
+ */
+function inSignup(field: FieldRow, expectedSignupId: string | undefined): boolean {
+  return expectedSignupId === undefined || field.signupId === expectedSignupId;
 }
 
 export async function listFieldsForSignup(
@@ -56,13 +71,12 @@ export async function listFieldsForSignup(
     .select()
     .from(slotFields)
     .where(eq(slotFields.signupId, signupId))
-    .orderBy(asc(slotFields.sortOrder), asc(slotFields.createdAt));
+    // The id is the last word. Fields made in one transaction (every field
+    // `createSignup` writes) share a `createdAt`, so two of them on one
+    // sortOrder had no fixed order and Postgres could return them either way
+    // round from one read to the next.
+    .orderBy(asc(slotFields.sortOrder), asc(slotFields.createdAt), asc(slotFields.id));
   return rows.map(rowToDefinition);
-}
-
-interface ReminderSettingsLike {
-  reminderFromFieldRef?: string | undefined;
-  [k: string]: unknown;
 }
 
 /**
@@ -79,7 +93,7 @@ interface ReminderSettingsLike {
  * time — noon is not a sentinel, a genuine `12:00` slot stores the same bytes.
  */
 export function extractSlotAt(
-  settings: ReminderSettingsLike,
+  settings: StoredSignupSettings,
   fields: SlotFieldDefinition[],
   values: Record<string, unknown>,
 ): Date | null {
@@ -90,29 +104,25 @@ export function extractSlotAt(
   const timeOfDay = slotTimeOfDay(settings, fields, values);
   const at = new Date(`${dateVal}T${timeOfDay ? `${timeOfDay}:00` : '12:00:00'}.000Z`);
   // An unparseable instant is null, never an Invalid Date. A NaN date is not
-  // equal to itself, so recomputeSlotAtForSignup's change check never matches
+  // equal to itself, so rebuildSlotAt's change check never matches
   // and it would send that row back to the database on every single pass.
   return Number.isNaN(at.getTime()) ? null : at;
 }
 
 /**
- * Re-derive slots.slot_at for every slot in a signup. Runs inside the caller's
- * transaction. Takes the signup lock (`lockSignupForWrite`) and then the slot
- * rows, so the signup-then-slots order holds whoever calls it; for a caller
- * that already holds the signup lock, taking it again is just the settings
- * read.
+ * Re-derive slots.slot_at for every slot in a signup from `settings` and
+ * `fields`, which the caller read under the signup lock it holds
+ * (`lockSignupForWrite`) and passes as they now stand, its own changes
+ * included. Runs inside the caller's transaction and locks the slot rows
+ * after the signup's, so the signup-then-slots order holds.
  */
-export async function recomputeSlotAtForSignup(
+export async function rebuildSlotAt(
   tx: Tx,
   signupId: string,
   workspaceId: string | null,
+  settings: StoredSignupSettings,
+  fields: SlotFieldDefinition[],
 ): Promise<{ updated: number }> {
-  const signupRow = await lockSignupForWrite(tx, signupId, workspaceId);
-  // Every caller has found the signup and holds its lock, so a miss is a wrong
-  // id or workspace passed in. Carrying on would rewrite nothing and say so.
-  if (!signupRow) throw new Error('slot_at rebuild: signup not found under the lock');
-  const settings = (signupRow.settings as ReminderSettingsLike) ?? {};
-  const fields = await listFieldsForSignup(tx, signupId);
   // Locked, not just read. A slot edit takes the signup lock the caller holds,
   // so none is in flight here; the rows are locked all the same, in the shared
   // order, before any is written, and a slot held without the signup lock
@@ -123,7 +133,7 @@ export async function recomputeSlotAtForSignup(
 
   const changed: { id: string; at: Date | null }[] = [];
   for (const row of slotRows) {
-    const next = extractSlotAt(settings, fields, (row.values as Record<string, unknown>) ?? {});
+    const next = extractSlotAt(settings, fields, row.values);
     const cur = row.slotAt;
     const same =
       (next === null && cur === null) ||
@@ -172,35 +182,55 @@ export async function addField(
   const input = parseInputSafe(SlotFieldInputSchema, rawInput);
   if (!input.ok) return input;
   const data = input.value;
-
-  const signupRow = await readLiveSignup(db, signupId);
-  if (!signupRow) return err(serviceError('not_found', 'signup not found'));
-  requireWorkspaceWrite(actor, signupRow.workspaceId);
+  const { beforeFieldId } = data;
+  if (beforeFieldId !== undefined && data.sortOrder !== undefined) {
+    return err(
+      serviceError('invalid_input', 'sortOrder cannot be used together with beforeFieldId', {
+        field: 'sortOrder',
+        suggestion: 'leave sortOrder out: the field goes in front of beforeFieldId',
+      }),
+    );
+  }
 
   const id = makeId('fld');
-  return db.transaction(async (tx) => {
-    // Taken whatever the input: a date or time field re-anchors below, which
-    // reads settings and writes them back, and a settings save landing in
-    // between would be lost; an append reads the top sortOrder under it. It is
-    // cheap, and the order stays the same for all. No row means no lock was
-    // taken, so nothing below may run.
-    const locked = await lockSignupForWrite(tx, signupId, signupRow.workspaceId);
-    if (!locked) return err(serviceError('not_found', 'signup not found'));
-
+  // The signup lock is taken whatever the input: a date or time field
+  // re-anchors below, which reads settings and writes them back, and a settings
+  // save landing in between would be lost; an append reads the top sortOrder
+  // under it. It is cheap, and the order stays the same for all.
+  return withSignupWriteLock(db, actor, signupId, async (tx, signupRow) => {
     // An omitted sortOrder appends. The build page never sends one, and
     // defaulting it to 0 put every field it added ahead of the template's
     // date column (DEFAULT_TEMPLATE pins it at 1), so a new column
     // reappeared mid-grid after a reload.
     let sortOrder = data.sortOrder;
-    if (sortOrder === undefined) {
+    // In front of another field: the new field takes that field's position,
+    // and every field is renumbered around it once it is in. The signup lock
+    // keeps every other field write out, so the position found here holds.
+    let shown: SlotFieldDefinition[] | undefined;
+    if (beforeFieldId !== undefined) {
+      shown = await listFieldsForSignup(tx, signupId);
+      sortOrder = shown.findIndex((f) => f.id === beforeFieldId);
+      if (sortOrder < 0) {
+        return err(
+          serviceError('invalid_input', 'beforeFieldId is not a field in this signup', {
+            field: 'beforeFieldId',
+            received: beforeFieldId,
+            suggestion: 'call get_signup to see the ids of its fields, in the order they are shown',
+          }),
+        );
+      }
+    } else if (sortOrder === undefined) {
       // Under the signup lock: two concurrent adds would otherwise read the
       // same max and land on the same sortOrder, leaving their order to the
-      // createdAt tiebreak.
+      // createdAt tiebreak. Held at the column's top, as `nextSlotSortOrder`
+      // does for slots: a field sent there would otherwise make every later
+      // add fail the insert; past it, appends tie instead.
       const [top] = await tx
         .select({ max: sql<number | null>`max(${slotFields.sortOrder})` })
         .from(slotFields)
         .where(eq(slotFields.signupId, signupId));
-      sortOrder = top?.max === null || top?.max === undefined ? 0 : top.max + 1;
+      sortOrder =
+        top?.max === null || top?.max === undefined ? 0 : Math.min(top.max + 1, MAX_SORT_ORDER);
     }
 
     const [row] = await tx
@@ -231,6 +261,21 @@ export async function addField(
       );
     }
 
+    // Set when the renumbering below swapped two date or time fields that
+    // were tied, which moves slot_at even though the new field is neither.
+    let timelineMoved = false;
+    if (shown) {
+      // Renumbered rather than shifted down by one: orders can be tied (the
+      // state this exists to get out of), and a shift would keep the tie.
+      const ids = shown.map((f) => f.id);
+      ids.splice(sortOrder, 0, row.id);
+      await writeFieldOrder(tx, signupId, ids);
+      const renumbered = new Map(ids.map((fieldId, i) => [fieldId, i]));
+      timelineMoved =
+        timeline(shown) !==
+        timeline(shown.map((f) => ({ ...f, sortOrder: renumbered.get(f.id) ?? f.sortOrder })));
+    }
+
     // A signup that just gained its first date field now has something to
     // anchor on, and a new time field may pair with the existing date, so
     // adding either re-anchors and rebuilds the slot_at cache. No-op when
@@ -239,15 +284,15 @@ export async function addField(
     // Any other type is skipped. The anchor and slot_at read only the type and
     // order of date and time fields (src/lib/reminder-fields.ts), and no slot
     // has a value for a field that did not exist, so a text, number or enum
-    // field cannot move either. The rebuild locks every slot row: run for one
-    // of those, the add would queue behind everyone part-way through signing
-    // up and then hold up everyone after them. Gated on the type, not on "is
-    // this the anchor": a time field is never the anchor and still moves
-    // slot_at (see `deleteField`).
+    // field cannot move either, unless placing it renumbered two tied date or
+    // time fields into a different order. The rebuild locks every slot row:
+    // run for one of those, the add would queue behind everyone part-way
+    // through signing up and then hold up everyone after them. Gated on the
+    // type, not on "is this the anchor": a time field is never the anchor and
+    // still moves slot_at (see `deleteField`).
     let anchor: string | null | undefined;
-    if (isDateOrTime(row.fieldType)) {
-      anchor = await reanchor(tx, signupId, await listFieldsForSignup(tx, signupId));
-      await recomputeSlotAtForSignup(tx, signupId, signupRow.workspaceId);
+    if (isDateOrTime(row.fieldType) || timelineMoved) {
+      anchor = await syncAnchorAndSlotAt(tx, signupId, signupRow.workspaceId);
     }
 
     await recordActivity(tx, {
@@ -259,10 +304,103 @@ export async function addField(
         fieldId: row.id,
         ref: row.ref,
         fieldType: row.fieldType,
+        ...(beforeFieldId !== undefined ? { beforeFieldId } : {}),
         ...(anchor !== undefined ? { reminderFromFieldRef: anchor } : {}),
       },
     });
     return ok(rowToDefinition(row));
+  });
+}
+
+/**
+ * Number a signup's fields 0..n-1 in the order of `orderedIds`, writing only
+ * the rows whose order changes. The caller has passed the policy guard and
+ * holds the signup lock, and `orderedIds` is every field of the signup, as
+ * `writeSlotOrder` asks of slots.
+ */
+async function writeFieldOrder(tx: Queryable, signupId: string, orderedIds: string[]) {
+  const wanted = sql`jsonb_array_elements_text(${JSON.stringify(orderedIds)}::jsonb)
+    with ordinality as wanted(id, position)`;
+  await tx
+    .update(slotFields)
+    .set({ sortOrder: sql`(wanted.position - 1)::int` })
+    .from(wanted)
+    .where(
+      and(
+        eq(slotFields.signupId, signupId),
+        sql`${slotFields.id} = wanted.id`,
+        sql`${slotFields.sortOrder} <> wanted.position - 1`,
+      ),
+    );
+}
+
+/**
+ * Put a signup's fields in a new order. `fieldIds` has to be every field of
+ * the signup exactly once, for the reason `reorderSlots` gives: a partial list
+ * would leave the fields it skips tied with the ones it names.
+ */
+export async function reorderFields(
+  db: Db,
+  actor: Actor,
+  signupId: string,
+  rawInput: unknown,
+): Promise<Result<SlotFieldDefinition[], ServiceError>> {
+  const input = parseInputSafe(SlotFieldReorderInputSchema, rawInput);
+  if (!input.ok) return input;
+  const { fieldIds } = input.value;
+
+  // Every field write takes the signup lock, so the list read under it is the
+  // list the renumbering writes over.
+  return withSignupWriteLock(db, actor, signupId, async (tx, signupRow) => {
+    const current = await listFieldsForSignup(tx, signupId);
+    const known = new Set(current.map((f) => f.id));
+
+    const seen = new Set<string>();
+    const duplicates = new Set<string>();
+    for (const id of fieldIds) (seen.has(id) ? duplicates : seen).add(id);
+    const unknown = [...seen].filter((id) => !known.has(id));
+    const missing = current.filter((f) => !seen.has(f.id)).map((f) => f.id);
+    if (duplicates.size > 0 || unknown.length > 0 || missing.length > 0) {
+      return err(
+        serviceError('invalid_input', 'fieldIds must list every field of the signup exactly once', {
+          field: 'fieldIds',
+          details: {
+            ...(missing.length > 0 ? { missing } : {}),
+            ...(unknown.length > 0 ? { unknown } : {}),
+            ...(duplicates.size > 0 ? { duplicates: [...duplicates] } : {}),
+          },
+          suggestion:
+            'call get_signup to see the ids of its fields, then send every one of them once, ' +
+            'in the order you want them shown',
+        }),
+      );
+    }
+
+    await writeFieldOrder(tx, signupId, fieldIds);
+    const next = await listFieldsForSignup(tx, signupId);
+
+    // Which time field pairs with the date, and which date field takes over
+    // the anchor, go by the order of the date and time fields, as in
+    // `updateField`. Rebuilt only when that order moved: the rebuild locks
+    // every slot row, and moving a text column should not queue behind
+    // everyone part-way through signing up.
+    let anchor: string | null | undefined;
+    if (timeline(current) !== timeline(next)) {
+      anchor = await syncAnchorAndSlotAt(tx, signupId, signupRow.workspaceId);
+    }
+
+    // Recorded even when the order already matched, as `reorderSlots` does.
+    await recordActivity(tx, {
+      signupId,
+      workspaceId: signupRow.workspaceId,
+      actor: activityActor(actor),
+      eventType: 'field.reordered',
+      payload: {
+        fieldIds,
+        ...(anchor !== undefined ? { reminderFromFieldRef: anchor } : {}),
+      },
+    });
+    return ok(next);
   });
 }
 
@@ -271,6 +409,7 @@ export async function updateField(
   actor: Actor,
   fieldId: string,
   rawInput: unknown,
+  expectedSignupId?: string,
 ): Promise<Result<SlotFieldDefinition, ServiceError>> {
   const input = parseInputSafe(SlotFieldUpdateInputSchema, rawInput);
   if (!input.ok) return input;
@@ -280,13 +419,10 @@ export async function updateField(
   // either with the field unchanged would pass off a mistake as a save.
   if (asksForNothing(data)) return err(serviceError('invalid_input', 'nothing to update'));
 
-  const existing = await db
-    .select()
-    .from(slotFields)
-    .where(eq(slotFields.id, fieldId))
-    .limit(1)
-    .then((r) => r[0]);
-  if (!existing) return err(serviceError('not_found', 'field not found'));
+  const existing = await readField(db, fieldId);
+  if (!existing || !inSignup(existing, expectedSignupId)) {
+    return err(serviceError('not_found', 'field not found'));
+  }
   requireWorkspaceWrite(actor, existing.workspaceId);
 
   if (data.fieldType !== undefined && data.config === undefined) {
@@ -305,12 +441,7 @@ export async function updateField(
     // Read again under the lock. `deleteField` and another `updateField` take
     // it too, and either may have committed while this one waited: the field
     // can be gone, or be a type the config above was never checked against.
-    const current = await tx
-      .select()
-      .from(slotFields)
-      .where(eq(slotFields.id, fieldId))
-      .limit(1)
-      .then((r) => r[0]);
+    const current = await readField(tx, fieldId);
     if (!current) return err(serviceError('not_found', 'field not found'));
     const stale = configMismatch(data, current.fieldType);
     if (stale) return err(stale);
@@ -351,8 +482,7 @@ export async function updateField(
       };
       const offending: string[] = [];
       for (const row of slotRows) {
-        const values = (row.values as Record<string, unknown>) ?? {};
-        const r = validateOneValue(nextDef, values[current.ref]);
+        const r = validateOneValue(nextDef, row.values[current.ref]);
         if (!r.ok) offending.push(row.id);
       }
       if (offending.length > 0) {
@@ -398,12 +528,7 @@ export async function updateField(
       sent.fieldType !== undefined || sent.sortOrder !== undefined || sent.config !== undefined;
     let anchor: string | null | undefined;
     if (feedsSlotAt && mayMoveSlotAt) {
-      anchor = await reanchor(
-        tx,
-        existing.signupId,
-        await listFieldsForSignup(tx, existing.signupId),
-      );
-      await recomputeSlotAtForSignup(tx, existing.signupId, existing.workspaceId);
+      anchor = await syncAnchorAndSlotAt(tx, existing.signupId, existing.workspaceId);
     }
 
     const changes: Record<string, unknown> = {};
@@ -475,14 +600,12 @@ export async function deleteField(
   db: Db,
   actor: Actor,
   fieldId: string,
+  expectedSignupId?: string,
 ): Promise<Result<{ deleted: true }, ServiceError>> {
-  const existing = await db
-    .select()
-    .from(slotFields)
-    .where(eq(slotFields.id, fieldId))
-    .limit(1)
-    .then((r) => r[0]);
-  if (!existing) return err(serviceError('not_found', 'field not found'));
+  const existing = await readField(db, fieldId);
+  if (!existing || !inSignup(existing, expectedSignupId)) {
+    return err(serviceError('not_found', 'field not found'));
+  }
   requireWorkspaceWrite(actor, existing.workspaceId);
 
   return db.transaction(async (tx) => {
@@ -493,11 +616,7 @@ export async function deleteField(
     // on the same signup: all three take it.
     const signupRow = await lockSignupForWrite(tx, existing.signupId, existing.workspaceId);
     if (!signupRow) return err(serviceError('not_found', 'signup not found'));
-    const currentSettings =
-      (signupRow.settings as {
-        groupByFieldRefs?: string[];
-        [k: string]: unknown;
-      }) ?? {};
+    const currentSettings = signupRow.settings;
     const groupBy = currentSettings.groupByFieldRefs ?? [];
     const removedFromGroupBy = groupBy.includes(existing.ref);
 
@@ -526,12 +645,7 @@ export async function deleteField(
     // none is left); deleting a time field changes what pairs with the date;
     // and the values wipe above changes what every slot resolves to. Rebuild
     // unconditionally — gating this on "was it the anchor" missed the rest.
-    const moved = await reanchor(
-      tx,
-      existing.signupId,
-      await listFieldsForSignup(tx, existing.signupId),
-    );
-    await recomputeSlotAtForSignup(tx, existing.signupId, existing.workspaceId);
+    const moved = await syncAnchorAndSlotAt(tx, existing.signupId, existing.workspaceId);
 
     await recordActivity(tx, {
       signupId: existing.signupId,
@@ -554,9 +668,8 @@ export async function listFields(
   actor: Actor,
   signupId: string,
 ): Promise<Result<SlotFieldDefinition[], ServiceError>> {
-  const signupRow = await readLiveSignup(db, signupId);
-  if (!signupRow) return err(serviceError('not_found', 'signup not found'));
-  requireWorkspaceAccess(actor, signupRow.workspaceId);
+  const loaded = await getSignupRowForOrganizer(db, actor, signupId);
+  if (!loaded.ok) return loaded;
   return ok(await listFieldsForSignup(db, signupId));
 }
 
@@ -581,6 +694,18 @@ export function validateSlotValues(
   return ok(undefined);
 }
 
+// The date and time fields in the order src/lib/reminder-fields.ts reads them
+// (ties go by ref), as one string. Two lists that give different strings pair
+// a different time with the date, or anchor on a different date, so a tie the
+// renumbering broke the other way counts as a move.
+function timeline(fields: SlotFieldDefinition[]): string {
+  return fields
+    .filter((f) => isDateOrTime(f.fieldType))
+    .sort((a, b) => a.sortOrder - b.sortOrder || (a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0))
+    .map((f) => f.id)
+    .join(' ');
+}
+
 /** The only field types the reminder anchor and `slots.slot_at` are read from. */
 function isDateOrTime(fieldType: string): boolean {
   return fieldType === 'date' || fieldType === 'time';
@@ -588,34 +713,6 @@ function isDateOrTime(fieldType: string): boolean {
 
 function isMissing(value: unknown): boolean {
   return value === undefined || value === null || value === '';
-}
-
-/**
- * A YYYY-MM-DD string naming a day that exists, in any year.
- *
- * The shape regex alone accepts 2026-13-45 and 2026-02-30, which reach
- * `new Date()` as an Invalid Date (or, for 02-30, silently roll into March).
- * Checking the parts round-trip rejects both.
- */
-function isCalendarDate(value: string): boolean {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (!m) return false;
-  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
-  // Not `Date.UTC(y, …)`: it reads years 0–99 as 1900–1999, so 0099-12-31
-  // would fail the round trip and be called impossible rather than too early.
-  // setUTCFullYear takes the year as written.
-  const at = new Date(0);
-  at.setUTCFullYear(y, mo - 1, d);
-  return at.getUTCFullYear() === y && at.getUTCMonth() === mo - 1 && at.getUTCDate() === d;
-}
-
-/**
- * A value a date field takes: a YYYY-MM-DD day that exists, in
- * `MIN_DATE_YEAR` or later. Magic Compose blanks a drafted date that fails it,
- * since `createSignup` would otherwise refuse the whole draft over one cell.
- */
-export function isRealDate(value: string): boolean {
-  return isCalendarDate(value) && Number(value.slice(0, 4)) >= MIN_DATE_YEAR;
 }
 
 function validateOneValue(field: SlotFieldDefinition, value: unknown): Result<void, ServiceError> {
@@ -632,7 +729,8 @@ function validateOneValue(field: SlotFieldDefinition, value: unknown): Result<vo
           }),
         );
       }
-      const max = field.config.fieldType === 'text' ? field.config.maxLength : 200;
+      const max =
+        field.config.fieldType === 'text' ? field.config.maxLength : TEXT_DEFAULT_MAX_LENGTH;
       if (value.length > max) {
         return err(
           serviceError('invalid_input', `"${field.ref}" exceeds maxLength ${max}`, {
@@ -706,35 +804,38 @@ function validateOneValue(field: SlotFieldDefinition, value: unknown): Result<vo
 }
 
 /**
- * Keeps `settings.reminderFromFieldRef` naming a real date field after a
- * field change. Left alone while it names one of `fields`' date fields;
- * otherwise moved to the first date field, or dropped when there is none.
- * Returns the ref it moved to (null = dropped), or undefined when nothing
- * changed. Must run inside the same transaction as the field change.
+ * Brings a signup's anchor and every slot's slot_at up to date after a field
+ * change. Keeps `settings.reminderFromFieldRef` naming a real date field: left
+ * alone while it names one of the signup's date fields, otherwise moved to the
+ * first date field, or dropped when there is none. Then rebuilds slot_at from
+ * those settings (`rebuildSlotAt`). The fields are listed once, and the
+ * settings read once, under the signup lock the caller holds: taking it again
+ * is just the read. Returns the ref the anchor moved to (null = dropped), or
+ * undefined when it stayed. Must run inside the same transaction as the field
+ * change.
  */
-async function reanchor(
-  tx: Queryable,
+async function syncAnchorAndSlotAt(
+  tx: Tx,
   signupId: string,
-  fields: SlotFieldDefinition[],
+  workspaceId: string | null,
 ): Promise<string | null | undefined> {
-  const row = await tx
-    .select({ settings: signups.settings })
-    .from(signups)
-    .where(eq(signups.id, signupId))
-    .limit(1)
-    .then((r) => r[0]);
-  if (!row) return undefined;
-  const settings = (row.settings as ReminderSettingsLike) ?? {};
+  const signupRow = await lockSignupForWrite(tx, signupId, workspaceId);
+  // Every caller has found the signup and holds its lock, so a miss is a wrong
+  // id or workspace passed in. Carrying on would rewrite nothing and say so.
+  if (!signupRow) throw new Error('anchor sync: signup not found under the lock');
+  const fields = await listFieldsForSignup(tx, signupId);
+  let settings = signupRow.settings;
   const next = resolveAnchorRef(settings, fields);
-  if (next === (settings.reminderFromFieldRef ?? null)) return undefined;
-
-  const { reminderFromFieldRef: _stale, ...rest } = settings;
-  await tx
-    .update(signups)
-    .set({
-      settings: next === null ? rest : { ...rest, reminderFromFieldRef: next },
-      updatedAt: new Date(),
-    })
-    .where(eq(signups.id, signupId));
-  return next;
+  let moved: string | null | undefined;
+  if (next !== (settings.reminderFromFieldRef ?? null)) {
+    const { reminderFromFieldRef: _stale, ...rest } = settings;
+    settings = next === null ? rest : { ...rest, reminderFromFieldRef: next };
+    await tx
+      .update(signups)
+      .set({ settings, updatedAt: new Date() })
+      .where(eq(signups.id, signupId));
+    moved = next;
+  }
+  await rebuildSlotAt(tx, signupId, workspaceId, settings, fields);
+  return moved;
 }

@@ -8,12 +8,14 @@ import {
   SUPPORT_MAILTO,
   operatorLabel,
 } from '@/lib/site-config';
+import { pageMetadata } from '@/lib/seo';
 
-export const metadata: Metadata = {
+export const metadata: Metadata = pageMetadata({
+  path: '/privacy',
   title: 'Privacy policy',
   description: `How ${INSTANCE_NAME} collects, uses, and stores your data — what we keep for organizers and participants, the cookies we set, and how long we retain it.`,
-  alternates: { canonical: '/privacy' },
-};
+  siteName: INSTANCE_NAME,
+});
 
 export default function PrivacyPage() {
   const operator = operatorLabel();
@@ -21,7 +23,7 @@ export default function PrivacyPage() {
     <>
       <header className="space-y-2">
         <h1 className="text-3xl font-semibold tracking-tight">Privacy policy</h1>
-        <p className="text-sm text-ink-muted">Last updated: 27 September 2026</p>
+        <p className="text-sm text-ink-muted">Last updated: 23 October 2026</p>
       </header>
 
       <section className="space-y-3">
@@ -54,17 +56,23 @@ export default function PrivacyPage() {
           <li>The signups, slots, and settings you create.</li>
           <li>
             An append-only activity log of organizer actions (sign-ins, creating and editing
-            signups, sending magic links), participant commitments on your signups, and reminder
-            dispatches. This exists so an organizer can audit what happened in their own workspace
-            and so the operator can investigate abuse. The same log records anonymous view telemetry
+            signups, sending magic links, copying a signup&rsquo;s link, a publish or an AI draft
+            that didn&rsquo;t go through), which of your own pages you open and whether on a phone
+            or a computer (never the browser&rsquo;s full identifying string), participant
+            commitments on your signups, and reminder dispatches. This exists so an organizer can
+            audit what happened in their own workspace, so the operator can investigate abuse, and
+            so the operator can count, in aggregate, where organizers get stuck between starting a
+            signup and sharing it. The same log records anonymous view telemetry
             on the marketing home page and on your public signup pages (see &ldquo;Logs and
             rate-limiting&rdquo; below).
           </li>
           <li>
-            For up to 15 minutes after a sign-in email is sent, the six-digit code printed in it
-            (stored as a keyed hash) and the encrypted sign-in link it stands for, so you can
-            finish signing in from the window you started in. A code is single use; used and
-            expired records cannot be redeemed and are deleted by an hourly cleanup.
+            After a sign-in email is sent, the sign-in link&apos;s token (stored as a hash, next to
+            your email address), kept until the link expires (an hour by default, or as long as the
+            operator sets it). For up to 15 minutes, the six-digit code printed in the email (stored
+            as a keyed hash) with the encrypted sign-in link it stands for, so you can finish
+            signing in from the window you started in. Both are single use. A used or expired one
+            cannot be redeemed, and an hourly cleanup deletes any that are left.
           </li>
           <li>
             If you connect an app or AI assistant to your account, a record of that approval and the
@@ -83,8 +91,12 @@ export default function PrivacyPage() {
         <ul className="list-disc space-y-1 pl-6">
           <li>Display name.</li>
           <li>
-            Email address. This is required so we can send you a confirmation, optional reminders,
-            and a link to edit or cancel your commitment.
+            Email address, if you give one. The organizer decides whether a signup requires it. We
+            use it to send you a confirmation with your link to change or cancel, and, if the
+            organizer has reminders on, reminders and an email when your slot moves to a new date
+            or time. If you leave it blank where that is allowed, we send you no
+            emails. Your link is then shown on screen after you sign up, and only that browser
+            remembers it: for 60 days, or until a week after your slot if that is later.
           </li>
           <li>Your slot selection, quantity, and any optional notes.</li>
           <li>
@@ -92,8 +104,8 @@ export default function PrivacyPage() {
           </li>
         </ul>
         <p>
-          A short-lived browser cookie lets you return and edit or cancel your own commitment
-          without re-entering your email. See the{' '}
+          A browser cookie keeps your link to change or cancel, so you can come back to your own
+          commitment from the same browser. See the{' '}
           <Link href="/cookies" className="text-brand underline">
             cookies page
           </Link>{' '}
@@ -107,8 +119,9 @@ export default function PrivacyPage() {
           To prevent abuse, the server records request IP addresses in short-lived rate-limit
           records (e.g. to throttle magic-link sends). These rows are scoped to individual buckets
           and are not joined to your account or commitment for analytics. Server-side application
-          logs are standard request/error logs and do not include cookies, tokens, or magic-link
-          URLs.
+          logs are standard request/error logs and do not include cookies, tokens, magic-link
+          URLs, or email addresses; sign-in log lines name only the part of the address after the
+          @.
         </p>
         <p>
           For each view of a public signup page, the server writes a single activity entry
@@ -125,14 +138,17 @@ export default function PrivacyPage() {
       <section className="space-y-3">
         <h2 className="text-xl font-semibold tracking-tight">Email delivery</h2>
         <p>
-          {INSTANCE_NAME} sends three kinds of email: organizer magic-link sign-in emails, a
-          confirmation to a participant when they commit to a slot, and a reminder before a dated
-          slot. Moving to a different slot sends a fresh confirmation, because the private link in
-          the old one stops working. Confirmations and reminders each contain a private link that
-          lets you change or cancel that commitment without signing in, so treat them as you would a
-          password and don&apos;t forward them. Reminders go out the day before the slot;
-          organizers can turn them off for a signup entirely. Every reminder carries a link that stops
-          reminders for that signup; we record only the time you opted out, and it does not affect
+          {INSTANCE_NAME} sends four kinds of email: organizer magic-link sign-in emails, a
+          confirmation to a participant when they commit to a slot, a reminder before a dated
+          slot, and an email when the organizer moves a participant&apos;s slot to a new date or
+          time. A participant gets these only if they gave an email address. Moving to a different
+          slot gives your spot a new private link, and sends a fresh confirmation with it. The
+          old link then leads to the new one. Each of these participant emails contains a private
+          link that lets you change or cancel that commitment without signing in, so treat them as
+          you would a password and don&apos;t forward them. Reminders go out the day before the slot,
+          and a moved-slot email about 10 minutes after the organizer&apos;s last change to its date
+          or time; organizers can turn both off for a signup entirely, with the reminders setting.
+          Every reminder and moved-slot email carries a link that stops both for that signup; we record only the time you opted out, and it does not affect
           any other signup or your slot itself. Delivery uses whichever transport the operator has
           configured (SMTP, a transactional provider, or local console output in
           development). No marketing email is ever sent.

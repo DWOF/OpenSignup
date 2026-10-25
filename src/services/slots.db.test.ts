@@ -244,8 +244,9 @@ describe('addSlot order (db)', () => {
 
   it('does not tie with a drag reorder saved one slot at a time', async () => {
     const { signupId, idOf } = await makeSignup(fx, 'Add during drag', [0, 1, 2]);
-    // What the builder's moveRow sends for dragging c to the top, one PATCH
-    // per slot, with an add landing after the first of them.
+    // A client renumbering one slot at a time (as the builder's drag did
+    // before #326) moves c to the top, with an add landing after the first
+    // of them.
     const move = (name: string, sortOrder: number) =>
       updateSlot(fx.db, fx.actor, idOf(name), { sortOrder });
     expect((await move('c', 0)).ok).toBe(true);
@@ -276,6 +277,22 @@ describe('addSlot order (db)', () => {
       rows: [{ values: { what: 'bulk 1' } }, { values: { what: 'bulk 2' } }],
     });
     expect(bulk.ok, JSON.stringify(bulk)).toBe(true);
+  });
+
+  it('refuses a sortOrder past the top of the order column as invalid_input', async () => {
+    const { signupId, idOf } = await makeSignup(fx, 'Order out of range', [0]);
+    const added = await addSlot(fx.db, fx.actor, signupId, {
+      values: { what: 'far' },
+      sortOrder: 3_000_000_000,
+    });
+    const updated = await updateSlot(fx.db, fx.actor, idOf('a'), { sortOrder: 3_000_000_000 });
+    for (const r of [added, updated]) {
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe('invalid_input');
+        expect(r.error.field).toBe('sortOrder');
+      }
+    }
   });
 });
 
@@ -429,7 +446,7 @@ describe('addSlotsBulk beforeSlotId (db)', () => {
     // in ahead of one, since `addSlot` queues on the signup lock now; the add
     // stays to pin what the renumbering does with a row it was not given.
     const stale = [idOf('c'), idOf('b'), idOf('a')];
-    expect((await deleteSlot(fx.db, fx.actor, idOf('b'))).ok).toBe(true);
+    expect((await deleteSlot(fx.db, fx.actor, idOf('b'), { force: true })).ok).toBe(true);
     expect((await addSlot(fx.db, fx.actor, signupId, { values: { what: 'late' } })).ok).toBe(true);
 
     await fx.db.transaction((tx) => writeSlotOrder(tx, signupId, stale));
@@ -972,7 +989,7 @@ describe('slot writes and the signup lock (db)', () => {
     if (!slot.ok) throw new Error('slot setup failed');
     let editing: ReturnType<typeof updateSlot> | undefined;
     const held = fx.db.transaction(async (tx) => {
-      const gone = await deleteSlot(tx as unknown as Db, colleague, slot.value.id);
+      const gone = await deleteSlot(tx as unknown as Db, colleague, slot.value.id, { force: true });
       expect(gone.ok, JSON.stringify(gone)).toBe(true);
       editing = updateSlot(fx.db, fx.actor, slot.value.id, { capacity: 4 });
       await untilServiceBlockedOn(fx.db, tx, editing);

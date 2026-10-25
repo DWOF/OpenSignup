@@ -184,6 +184,63 @@ describe('signup write tools on Postgres', () => {
     expect(after.signups).toHaveLength(before.signups.length);
   });
 
+  it('create_signup refuses a field with no value in any slot and writes nothing', async () => {
+    const client = await connectTestClient(ctx, TOOLS);
+    const before = (await client.callTool({ name: 'list_signups', arguments: {} })).structuredContent as { signups: unknown[] };
+    const r = await client.callTool({
+      name: 'create_signup',
+      arguments: {
+        title: 'Snack rota',
+        fields: [
+          { ref: 'item', label: 'Item', fieldType: 'text' },
+          { ref: 'parent-name', label: 'Parent name', fieldType: 'text' },
+        ],
+        slots: [{ values: { item: 'Juice', 'parent-name': '' } }, { values: { item: 'Fruit', 'parent-name': null } }, { values: { item: 'Cake' } }],
+      },
+    });
+    expect(r.isError).toBe(true);
+    const error = (r.structuredContent as { error: { code: string; suggestion: string } }).error;
+    expect(error.code).toBe('invalid_input');
+    expect(error.suggestion).toContain('field "parent-name" has no value in any slot');
+    expect(error.suggestion).not.toContain('"item"');
+    const after = (await client.callTool({ name: 'list_signups', arguments: {} })).structuredContent as { signups: unknown[] };
+    expect(after.signups).toHaveLength(before.signups.length);
+  });
+
+  it('create_signup keeps a field that has a value in at least one slot', async () => {
+    const client = await connectTestClient(ctx, TOOLS);
+    const r = await client.callTool({
+      name: 'create_signup',
+      arguments: {
+        title: 'Snack rota partly noted',
+        fields: [
+          { ref: 'item', label: 'Item', fieldType: 'text' },
+          { ref: 'note', label: 'Note', fieldType: 'text' },
+        ],
+        slots: [{ values: { item: 'Juice', note: 'No nuts' } }, { values: { item: 'Fruit' } }],
+      },
+    });
+    expect(r.isError, JSON.stringify(r.structuredContent)).toBeFalsy();
+    const fields = (r.structuredContent as { fields: Array<{ ref: string }> }).fields;
+    expect(fields.map((f) => f.ref)).toEqual(['item', 'note']);
+  });
+
+  it('create_signup reports a field whose every value has the wrong format once, as a format problem', async () => {
+    const client = await connectTestClient(ctx, TOOLS);
+    const r = await client.callTool({
+      name: 'create_signup',
+      arguments: {
+        title: 'Bad dates only',
+        fields: [{ ref: 'date', label: 'Date', fieldType: 'date' }],
+        slots: [{ values: { date: '3 October' } }, { values: { date: '4 October' } }],
+      },
+    });
+    const error = (r.structuredContent as { error: { code: string; suggestion: string } }).error;
+    expect(error.code).toBe('invalid_input');
+    expect(error.suggestion).toContain('"date" must be an ISO date');
+    expect(error.suggestion).not.toContain('no value in any slot');
+  });
+
   it('a deleted signup reports deleted, deletes idempotently, and cannot be updated or published', async () => {
     const client = await connectTestClient(ctx, TOOLS);
     const created = await client.callTool({
@@ -227,6 +284,16 @@ describe('signup write tools on Postgres', () => {
     const u = updated.structuredContent as { signup: { settings: Record<string, unknown> } };
     expect(u.signup.settings).toMatchObject({ sendReminders: false, groupByFieldRefs: ['day'] });
 
+    // A group-by that names no field is refused, and the one stored stays (#516).
+    const badGroup = await client.callTool({
+      name: 'update_signup',
+      arguments: { signupId: c.signup.id, settings: { groupByFieldRefs: ['nope'] } },
+    });
+    expect(badGroup.isError).toBe(true);
+    expect((badGroup.structuredContent as { error: { code: string } }).error.code).toBe('invalid_input');
+    const [grouped] = await db.select({ settings: signups.settings }).from(signups).where(eq(signups.id, c.signup.id));
+    expect(grouped?.settings).toMatchObject({ groupByFieldRefs: ['day'] });
+
     // A closing time can be set, then cleared with null, leaving the settings alone.
     const closing = await client.callTool({
       name: 'update_signup',
@@ -240,16 +307,30 @@ describe('signup write tools on Postgres', () => {
     expect(cl.signup.settings).toMatchObject({ sendReminders: false, groupByFieldRefs: ['day'] });
     expect(cl.signup.closesAt).toBeNull();
 
+    // requireEmail is shown with the default createSignup stored, and can be
+    // turned off and on again.
+    expect(cl.signup.settings).toMatchObject({ requireEmail: true });
+    for (const requireEmail of [false, true]) {
+      const set = await client.callTool({
+        name: 'update_signup',
+        arguments: { signupId: c.signup.id, settings: { requireEmail } },
+      });
+      expect(set.isError, JSON.stringify(set.structuredContent)).toBeFalsy();
+      const s = set.structuredContent as { signup: { settings: Record<string, unknown> } };
+      expect(s.signup.settings).toMatchObject({ requireEmail, sendReminders: false, groupByFieldRefs: ['day'] });
+      const [stored] = await db.select({ settings: signups.settings }).from(signups).where(eq(signups.id, c.signup.id));
+      expect(stored?.settings).toMatchObject({ requireEmail });
+    }
+
     // Settings nothing reads are refused and nothing is stored, and the stored
     // defaults createSignup filled in for them are not shown.
     const [before] = await db.select({ settings: signups.settings }).from(signups).where(eq(signups.id, c.signup.id));
-    expect(before?.settings).toMatchObject({ requireEmail: true, allowNotes: true, showWhoSignedUp: true });
-    for (const key of ['maxCommitmentsPerParticipant', 'requireEmail', 'allowNotes', 'showWhoSignedUp', 'confirmationMessage']) {
+    expect(before?.settings).toMatchObject({ allowNotes: true, showWhoSignedUp: true });
+    for (const key of ['maxCommitmentsPerParticipant', 'allowNotes', 'showWhoSignedUp', 'confirmationMessage']) {
       expect(cl.signup.settings, key).not.toHaveProperty(key);
     }
     for (const unread of [
       { maxCommitmentsPerParticipant: 2 },
-      { requireEmail: false },
       { allowNotes: false },
       { showWhoSignedUp: false },
       { confirmationMessage: 'See you there' },
@@ -405,6 +486,138 @@ describe('field and slot tools on Postgres', () => {
       ['a', 0],
       ['b', 1],
     ]);
+  });
+
+  async function createWithFields(
+    client: Awaited<ReturnType<typeof connectTestClient>>,
+    title: string,
+  ) {
+    const created = await client.callTool({
+      name: 'create_signup',
+      arguments: {
+        title,
+        fields: [
+          { ref: 'what', label: 'What', fieldType: 'text' },
+          { ref: 'who', label: 'Who', fieldType: 'text' },
+        ],
+        slots: [{ values: { what: 'Fruit', who: 'Class 3' } }],
+      },
+    });
+    expect(created.isError, JSON.stringify(created.structuredContent)).toBeFalsy();
+    return created.structuredContent as {
+      signup: { id: string };
+      fields: { id: string; ref: string }[];
+    };
+  }
+
+  type ShownField = { id: string; ref: string; sortOrder: number };
+  async function fieldsOf(client: Awaited<ReturnType<typeof connectTestClient>>, signupId: string) {
+    const detail = await client.callTool({ name: 'get_signup', arguments: { signupId } });
+    return (detail.structuredContent as { fields: ShownField[] }).fields.map((f) => [
+      f.ref,
+      f.sortOrder,
+    ]);
+  }
+
+  it('add_field with beforeFieldId puts the new field first, and get_signup agrees', async () => {
+    const client = await connectTestClient(ctx, TOOLS);
+    const c = await createWithFields(client, 'Field first');
+    const added = await client.callTool({
+      name: 'add_field',
+      arguments: {
+        signupId: c.signup.id,
+        ref: 'date',
+        label: 'Date',
+        fieldType: 'date',
+        beforeFieldId: c.fields[0]!.id,
+      },
+    });
+    expect(added.isError, JSON.stringify(added.structuredContent)).toBeFalsy();
+    expect((added.structuredContent as { field: ShownField }).field.sortOrder).toBe(0);
+    expect(await fieldsOf(client, c.signup.id)).toEqual([
+      ['date', 0],
+      ['what', 1],
+      ['who', 2],
+    ]);
+  });
+
+  it('add_field refuses a sortOrder and names beforeFieldId', async () => {
+    const client = await connectTestClient(ctx, TOOLS);
+    const c = await createWithFields(client, 'Field sortOrder refused');
+    const r = await client.callTool({
+      name: 'add_field',
+      arguments: {
+        signupId: c.signup.id,
+        ref: 'date',
+        label: 'Date',
+        fieldType: 'date',
+        sortOrder: 0,
+      },
+    });
+    expect(r.isError).toBe(true);
+    expect(r.structuredContent).toMatchObject({ error: { code: 'invalid_input' } });
+    expect(JSON.stringify(r.structuredContent)).toContain('beforeFieldId');
+    expect(await fieldsOf(client, c.signup.id)).toEqual([
+      ['what', 0],
+      ['who', 1],
+    ]);
+  });
+
+  it('reorder_fields gives the order asked for, 0..n-1, the same on every read', async () => {
+    const client = await connectTestClient(ctx, TOOLS);
+    const c = await createWithFields(client, 'Reorder fields');
+    const reversed = c.fields.map((f) => f.id).reverse();
+    const moved = await client.callTool({
+      name: 'reorder_fields',
+      arguments: { signupId: c.signup.id, fieldIds: reversed },
+    });
+    expect(moved.isError, JSON.stringify(moved.structuredContent)).toBeFalsy();
+    expect((moved.structuredContent as { fields: ShownField[] }).fields.map((f) => f.id)).toEqual(
+      reversed,
+    );
+    for (let i = 0; i < 3; i++) {
+      expect(await fieldsOf(client, c.signup.id)).toEqual([
+        ['who', 0],
+        ['what', 1],
+      ]);
+    }
+
+    const partial = await client.callTool({
+      name: 'reorder_fields',
+      arguments: { signupId: c.signup.id, fieldIds: reversed.slice(1) },
+    });
+    expect(partial.isError).toBe(true);
+    expect(partial.structuredContent).toMatchObject({
+      error: { code: 'invalid_input', field: 'fieldIds', details: { missing: [reversed[0]] } },
+    });
+  });
+
+  it('update_field refuses a sortOrder, names reorder_fields, and the order stays put', async () => {
+    const client = await connectTestClient(ctx, TOOLS);
+    const c = await createWithFields(client, 'No single field numbers');
+    const r = await client.callTool({
+      name: 'update_field',
+      arguments: { fieldId: c.fields[1]!.id, sortOrder: 0 },
+    });
+    expect(r.isError).toBe(true);
+    expect(r.structuredContent).toMatchObject({ error: { code: 'invalid_input' } });
+    expect(JSON.stringify(r.structuredContent)).toContain('reorder_fields');
+    expect(await fieldsOf(client, c.signup.id)).toEqual([
+      ['what', 0],
+      ['who', 1],
+    ]);
+  });
+
+  it('a viewer cannot reorder fields', async () => {
+    const client = await connectTestClient(ctx, TOOLS);
+    const c = await createWithFields(client, 'Viewer reorder');
+    const viewer = await connectTestClient(viewerCtx, TOOLS);
+    const r = await viewer.callTool({
+      name: 'reorder_fields',
+      arguments: { signupId: c.signup.id, fieldIds: c.fields.map((f) => f.id).reverse() },
+    });
+    expect(r.isError).toBe(true);
+    expect((r.structuredContent as { error: { code: string } }).error.code).toBe('forbidden');
   });
 
   it('a viewer cannot add slots', async () => {

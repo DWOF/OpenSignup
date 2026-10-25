@@ -1,47 +1,110 @@
 import { and, asc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
-import type { Db, Queryable, Tx } from '@/db/client';
-import { commitments } from '@/db/schema/commitments';
-import { participants } from '@/db/schema/participants';
-import { signups } from '@/db/schema/signups';
-import { slots } from '@/db/schema/slots';
-import { recordActivity } from '@/lib/activity';
+import type { Db, Queryable } from '@/db/client';
+import { activity } from '@/db/schema/activity';
+import { commitments, type Commitment as CommitmentRow } from '@/db/schema/commitments';
+import {
+  participantEmailColumns,
+  participantEmailKey,
+  participants,
+} from '@/db/schema/participants';
+import { signups, type Signup } from '@/db/schema/signups';
+import { slots, type Slot } from '@/db/schema/slots';
+import { activityActor, recordActivity } from '@/lib/activity';
 import { serviceError, ServiceException, type ServiceError } from '@/lib/errors';
 import { makeId } from '@/lib/ids';
 import { log } from '@/lib/log';
+import { summarizeSlotValues } from '@/lib/slot-summary';
+import { signupShutReason, slotInLockout } from '@/lib/signup-closing';
 import { parseInputSafe } from '@/lib/parse';
+import { requireWorkspaceWrite, type Actor } from '@/lib/policy';
+import { toPublicCommitment, type PublicCommitment } from '@/lib/public-commitment';
 import { err, ok, type Result } from '@/lib/result';
-import { editTokenFor, hashToken, verifyHash } from '@/lib/token';
+import { editTokenFor, hashToken, idempotencyKeyHash, verifyHash } from '@/lib/token';
 import {
   type CommitmentCreateInput,
   type CommitmentUpdateInput,
   CommitmentCreateInputSchema,
   CommitmentUpdateInputSchema,
 } from '@/schemas/commitments';
-import { readLiveSignup } from './locks';
+import { requiresEmail } from '@/schemas/signups';
+import { inWorkspace, readLiveSignup } from './locks';
+import { listFieldsForSignup } from './slot-fields';
 
-type CommitmentRow = typeof commitments.$inferSelect;
+/** A commitment with who made it. `participantEmail` is null when they gave none. */
+type OwnCommitment = PublicCommitment & {
+  participantName: string;
+  participantEmail: string | null;
+};
 
 /**
  * A commitment the participant can still act on. `cancelled` and `no_show`
- * are terminal end states that no participant action reopens. Only the
- * participant's own cancel or move writes `cancelled`; nothing writes
- * `no_show` yet.
+ * are terminal end states that no participant action reopens. The
+ * participant's own cancel or move writes `cancelled`, and so does an
+ * organizer removing them (`removeCommitment`); nothing writes `no_show` yet.
+ * The edit page says a `cancelled` one was cancelled, moved or removed, and
+ * gives `no_show` its not-found page.
  */
-const ACTIVE_COMMITMENT_STATUSES: readonly CommitmentRow['status'][] = [
+export const ACTIVE_COMMITMENT_STATUSES: readonly CommitmentRow['status'][] = [
   'confirmed',
   'tentative',
   'waitlist',
 ];
-const isActiveCommitment = inArray(commitments.status, [...ACTIVE_COMMITMENT_STATUSES]);
+export const isActiveCommitment = inArray(commitments.status, [...ACTIVE_COMMITMENT_STATUSES]);
+
+/**
+ * A commitment whose places count against its slot's capacity: confirmed or
+ * tentative. A waitlisted one is still active (above) but holds no place, and
+ * a cancelled one holds nothing. Every capacity check, and every count of
+ * places taken that a page shows, goes by this.
+ */
+export const holdsPlace = or(
+  eq(commitments.status, 'confirmed'),
+  eq(commitments.status, 'tentative'),
+)!;
+
+/**
+ * How many places a slot has taken (the sum of `quantity` over commitments
+ * that hold one), leaving out `exceptCommitmentId` when given: an edit checks
+ * a new quantity against everyone else's. Guard-free: the caller has checked
+ * the slot, and a capacity check holds the slot row lock (`lockSlot`) so the
+ * count cannot go up before it writes.
+ */
+export async function placesTaken(
+  q: Queryable,
+  slotId: string,
+  exceptCommitmentId?: string,
+): Promise<number> {
+  const [row] = await q
+    .select({ sum: sql<number>`coalesce(sum(${commitments.quantity}), 0)::int` })
+    .from(commitments)
+    .where(
+      and(
+        eq(commitments.slotId, slotId),
+        ...(exceptCommitmentId === undefined ? [] : [ne(commitments.id, exceptCommitmentId)]),
+        holdsPlace,
+      ),
+    );
+  return row?.sum ?? 0;
+}
+
+/**
+ * The `conflict` for an edit or cancel of a commitment that is no longer
+ * active. `details.status` is its status now, so a caller can tell a
+ * cancelled sign-up from another end state without reading the message.
+ */
+function notActive(status: CommitmentRow['status']): ServiceError {
+  return serviceError('conflict', 'commitment is not active', { details: { status } });
+}
 
 // Telemetry write inside an outer tx where a raw INSERT would otherwise abort
 // the surrounding transaction on failure. Uses a SAVEPOINT (Drizzle's nested
 // `tx.transaction`) so a failed activity insert rolls back only the savepoint,
-// leaving the outer tx free to return its intended ServiceError. Errors are
-// logged and swallowed — telemetry must never turn a `closed`/`capacity_full`
-// rejection into a 500.
+// leaving the outer tx free to return its intended ServiceError. Given a `Db`
+// instead, after a transaction rolled back, it writes in a transaction of its
+// own. Errors are logged and swallowed — telemetry must never turn a
+// `closed`/`capacity_full` rejection into a 500.
 async function safeRecordAttemptFailed(
-  tx: Tx,
+  tx: Queryable,
   args: {
     signupId: string | null;
     workspaceId: string | null;
@@ -67,18 +130,22 @@ async function safeRecordAttemptFailed(
 
 /**
  * Why a slot takes no more places, or null while it still does. The rules, in
- * the order `commitToSlot` has always checked them: the slot is closed; the
+ * the order signing up has always checked them: the slot is closed; the
  * signup's status is anything but `open` (a draft, closed or archived signup);
  * its `closesAt` has passed; or the slot starts within the signup's
- * `lockoutHoursBeforeSlot`. Signing up (`commitToSlot`, and so a move to
- * another slot), raising a quantity (`updateOwnCommitment`) and the edit
- * page's limit (`editLimitsForCommitment`) all ask this, so a place refused one
- * way cannot be had another. `reason` and `detail` are for the attempt_failed
- * row.
+ * `lockoutHoursBeforeSlot`. The two signup rules are `signupShutReason` and the
+ * lockout is `slotInLockout`, which the public page reads too. Taking a place
+ * (`commitParticipantToSlot`, for someone signing up and for a move to another
+ * slot), raising a quantity
+ * (`updateOwnCommitment`) and the edit page's limit (`editLimitsForCommitment`)
+ * all ask this, so a place refused one way cannot be had another; so does the
+ * edit page of a cancelled sign-up (`cancelledCommitmentState`), before it
+ * suggests signing up again. `reason`
+ * and `detail` are for the attempt_failed row.
  */
 function whyNotTakingPlaces(
-  signup: Pick<typeof signups.$inferSelect, 'status' | 'closesAt' | 'settings'>,
-  slot: Pick<typeof slots.$inferSelect, 'status' | 'slotAt'>,
+  signup: Pick<Signup, 'status' | 'closesAt' | 'settings'>,
+  slot: Pick<Slot, 'status' | 'slotAt'>,
 ): { reason: 'closed' | 'over_window'; detail: string; error: ServiceError } | null {
   if (slot.status !== 'open') {
     return {
@@ -87,7 +154,8 @@ function whyNotTakingPlaces(
       error: serviceError('closed', 'that slot is closed'),
     };
   }
-  if (signup.status !== 'open') {
+  const signupShut = signupShutReason(signup);
+  if (signupShut === 'status') {
     return {
       reason: 'closed',
       detail: `signup_${signup.status}`,
@@ -98,34 +166,36 @@ function whyNotTakingPlaces(
       }),
     };
   }
-  if (signup.closesAt && signup.closesAt.getTime() < Date.now()) {
+  if (signupShut === 'closes_at') {
     return {
       reason: 'over_window',
       detail: 'closes_at_elapsed',
       error: serviceError('closed', 'signup has closed'),
     };
   }
-  // Counted back from slot_at, so for a date-only slot it is measured from the
-  // noon-UTC anchor rather than from midnight (see extractSlotAt). No UI sets
-  // lockoutHoursBeforeSlot today.
-  const settings = (signup.settings ?? {}) as { lockoutHoursBeforeSlot?: number };
-  const lockoutHours = settings.lockoutHoursBeforeSlot ?? 0;
-  if (slot.slotAt && lockoutHours > 0) {
-    if (Date.now() > slot.slotAt.getTime() - lockoutHours * 3600 * 1000) {
-      return {
-        reason: 'over_window',
-        detail: 'slot_lockout',
-        error: serviceError('closed', 'too close to the slot time to sign up'),
-      };
-    }
+  if (slotInLockout(signup.settings, slot.slotAt)) {
+    return {
+      reason: 'over_window',
+      detail: 'slot_lockout',
+      error: serviceError('closed', 'too close to the slot time to sign up'),
+    };
   }
   return null;
 }
 
 export interface CommitResult {
-  commitment: CommitmentRow;
+  commitment: PublicCommitment;
   editToken: string;
   signupSlug: string;
+  /** The slot's instant, read under its lock, so the route can keep the
+   *  returning-participant cookie until after it without another query. */
+  slotAt: Date | null;
+  /**
+   * True when this was a sign-up sent again with the same idempotency key, so
+   * `commitment` is the one the first made and nothing was written. Its
+   * confirmation email, if it has one, went after the first.
+   */
+  repeated: boolean;
 }
 
 export async function commitToSlot(
@@ -135,8 +205,56 @@ export async function commitToSlot(
 ): Promise<Result<CommitResult, ServiceError>> {
   const input = parseInputSafe(CommitmentCreateInputSchema, rawInput);
   if (!input.ok) return input;
-  const data: CommitmentCreateInput = input.value;
+  const { email, idempotencyKey, ...data } = input.value;
+  // The key together with the request as parsed, so it finds an earlier
+  // sign-up only when sent again with the same details.
+  const keyHash =
+    idempotencyKey === undefined
+      ? undefined
+      : idempotencyKeyHash(idempotencyKey, { ...data, email: email ?? null });
+  return commitParticipantToSlot(
+    db,
+    slotId,
+    { email: email ?? null },
+    { ...data, idempotencyKeyHash: keyHash },
+  );
+}
 
+/**
+ * Takes a place on the slot. Someone signing up (`commitToSlot`) is found or
+ * added by `email`, and their participant takes the `name` they typed. One who
+ * gave no email (`email: null`), which only a signup with `requireEmail` off
+ * accepts, is always added. Someone moving from another slot
+ * (`updateOwnCommitment`) passes their `participantId`, so the move keeps the
+ * participant it had and never depends on the email or on `requireEmail`;
+ * their name changes only when the move sends one. Every other check is the
+ * same for both.
+ *
+ * A sign-up sent with an `idempotencyKey` and details that an earlier one on
+ * this slot was sent with (`idempotencyKeyHash`) gets that earlier commitment
+ * back, while it is still active, and nothing is written. That is a retry whose first try got through but
+ * whose response never arrived, such as a phone losing its connection. With
+ * an email the participant would be found again and refused as a duplicate,
+ * which loses their link; without one they would get a second place.
+ *
+ * Nothing is written for a sign-up that is refused: the participant is found
+ * by reading, and renamed or added only once every check has passed, just
+ * before the commitment goes in. A refusal as closed or full writes an
+ * attempt_failed row, by no one in particular, in a savepoint. A move passes
+ * `onRefused` instead, and gets the row's payload to write itself, because a
+ * refused move throws and rolls back the savepoint with everything else.
+ */
+async function commitParticipantToSlot(
+  db: Queryable,
+  slotId: string,
+  who: { email: string | null; participantId?: never } | { participantId: string; email?: never },
+  data: Pick<CommitmentCreateInput, 'notes' | 'quantity'> & {
+    name?: string;
+    idempotencyKeyHash?: string;
+  },
+  onRefused?: (payload: Record<string, unknown>) => void,
+): Promise<Result<CommitResult, ServiceError>> {
+  const keyHash = data.idempotencyKeyHash ?? null;
   return db.transaction(async (tx) => {
     const slotRows = await tx
       .select()
@@ -146,6 +264,16 @@ export async function commitToSlot(
       .limit(1);
     const slot = slotRows[0];
     if (!slot) return err(serviceError('not_found', 'slot not found'));
+    const refused = async (payload: Record<string, unknown>) => {
+      if (onRefused) return onRefused(payload);
+      await safeRecordAttemptFailed(tx, {
+        signupId: slot.signupId,
+        workspaceId: slot.workspaceId,
+        actorId: null,
+        actorType: 'system',
+        payload,
+      });
+    };
 
     // A deleted signup takes no one, though its status can still read open:
     // its page is gone, and a slot id or a page left open must not get round
@@ -155,85 +283,102 @@ export async function commitToSlot(
     const signupRow = await readLiveSignup(tx, slot.signupId);
     if (!signupRow) return err(serviceError('not_found', 'signup not found'));
 
+    // The active commitment an earlier sign-up with the same key made here.
+    // Its own statement, after the lock: a statement sees only what had
+    // committed when it started, so one that waited for the lock, such as
+    // the lock's own, would miss a first try that held the lock meanwhile.
+    // Before the checks below, since the place was taken when the first try
+    // got through: a signup or slot that has closed or filled since, or an
+    // email made required since, does not undo it.
+    if (keyHash !== null) {
+      const [earlier] = await tx
+        .select()
+        .from(commitments)
+        .where(
+          and(
+            eq(commitments.slotId, slotId),
+            inWorkspace(commitments.workspaceId, slot.workspaceId),
+            eq(commitments.idempotencyKeyHash, keyHash),
+            isActiveCommitment,
+          ),
+        )
+        .limit(1);
+      if (earlier) {
+        return ok({
+          commitment: toPublicCommitment(earlier),
+          editToken: editTokenFor(earlier.id),
+          signupSlug: signupRow.slug,
+          slotAt: slot.slotAt,
+          repeated: true,
+        });
+      }
+    }
+
     const shut = whyNotTakingPlaces(signupRow, slot);
     if (shut) {
-      await safeRecordAttemptFailed(tx, {
-        signupId: signupRow.id,
-        workspaceId: signupRow.workspaceId,
-        actorId: null,
-        actorType: 'system',
-        payload: { slotId, reason: shut.reason, detail: shut.detail },
-      });
+      await refused({ slotId, reason: shut.reason, detail: shut.detail });
       return err(shut.error);
     }
 
-    // Preserve user-entered casing in participants.email; dedup on emailLower.
-    const emailLower = data.email.toLowerCase();
-    const existingPart = await tx
-      .select()
-      .from(participants)
-      .where(and(eq(participants.signupId, slot.signupId), eq(participants.emailLower, emailLower)))
-      .limit(1);
-
-    let participantId: string;
-    if (existingPart[0]) {
-      participantId = existingPart[0].id;
-      await tx
-        .update(participants)
-        .set({ name: data.name, lastSeenAt: new Date() })
-        .where(eq(participants.id, participantId));
-    } else {
-      participantId = makeId('par');
-      await tx.insert(participants).values({
-        id: participantId,
-        signupId: slot.signupId,
-        workspaceId: slot.workspaceId,
-        email: data.email,
-        emailLower,
-        name: data.name,
-      });
-      await recordActivity(tx, {
-        signupId: slot.signupId,
-        workspaceId: slot.workspaceId,
-        actor: { actorId: participantId, actorType: 'participant' },
-        eventType: 'participant.created',
-        payload: { participantId },
-      });
-    }
-
-    // Conflict: same participant already holds an active commitment on this slot.
-    const own = await tx
-      .select()
-      .from(commitments)
-      .where(
-        and(
-          eq(commitments.slotId, slotId),
-          eq(commitments.participantId, participantId),
-          or(eq(commitments.status, 'confirmed'), eq(commitments.status, 'tentative')),
-        ),
-      )
-      .limit(1);
-    if (own[0]) {
+    // Asked of new sign-ups only, never of a move: someone who signed up
+    // without an email while it was optional keeps their place, and can still
+    // move it, after the organizer makes it required again.
+    if (who.email === null && requiresEmail(signupRow.settings)) {
       return err(
-        serviceError('conflict', 'you already committed to this slot', {
-          details: { commitmentId: own[0].id },
-          suggestion: 'edit or cancel your existing commitment',
+        serviceError('invalid_input', 'Email is required for this signup.', {
+          field: 'email',
+          suggestion: 'Add your email and try again.',
         }),
       );
     }
 
+    // The participant a move brings, or the one this signup already has under
+    // the email someone signs up with. Preserve user-entered casing in
+    // participants.email; dedup on emailLower. Someone who gave no email has
+    // nothing to be found by, so is always a new participant. Only read here:
+    // nothing about them is written until every check below has passed.
+    let participantId = who.participantId;
+    if (typeof who.email === 'string') {
+      const [found] = await tx
+        .select({ id: participants.id })
+        .from(participants)
+        .where(
+          and(
+            eq(participants.signupId, slot.signupId),
+            eq(participants.emailLower, participantEmailKey(who.email)),
+          ),
+        )
+        .limit(1);
+      participantId = found?.id;
+    }
+
+    // Conflict: same participant already holds an active commitment on this
+    // slot. A participant not found yet holds none.
+    if (participantId !== undefined) {
+      const own = await tx
+        .select()
+        .from(commitments)
+        .where(
+          and(
+            eq(commitments.slotId, slotId),
+            eq(commitments.participantId, participantId),
+            isActiveCommitment,
+          ),
+        )
+        .limit(1);
+      if (own[0]) {
+        return err(
+          serviceError('conflict', 'you already committed to this slot', {
+            details: { commitmentId: own[0].id },
+            suggestion: 'edit or cancel your existing commitment',
+          }),
+        );
+      }
+    }
+
     // Capacity is the cap on sum(quantity), not row count: a Qty=5 commit on a
     // cap=4 slot is over capacity even with zero existing rows.
-    const sumRows = await tx
-      .select({ sum: sql<number>`coalesce(sum(${commitments.quantity}), 0)::int` })
-      .from(commitments)
-      .where(
-        and(
-          eq(commitments.slotId, slotId),
-          or(eq(commitments.status, 'confirmed'), eq(commitments.status, 'tentative')),
-        ),
-      );
-    const usedQty = sumRows[0]?.sum ?? 0;
+    const usedQty = await placesTaken(tx, slotId);
 
     if (slot.capacity !== null && usedQty + data.quantity > slot.capacity) {
       const remaining = Math.max(0, slot.capacity - usedQty);
@@ -243,18 +388,7 @@ export async function commitToSlot(
         .where(and(eq(slots.signupId, slot.signupId), eq(slots.status, 'open'), ne(slots.id, slotId)))
         .orderBy(asc(slots.slotAt), asc(slots.sortOrder))
         .limit(3);
-      await safeRecordAttemptFailed(tx, {
-        signupId: slot.signupId,
-        workspaceId: slot.workspaceId,
-        actorId: null,
-        actorType: 'system',
-        payload: {
-          slotId,
-          reason: 'capacity_full',
-          requested: data.quantity,
-          remaining,
-        },
-      });
+      await refused({ slotId, reason: 'capacity_full', requested: data.quantity, remaining });
       return err(
         serviceError(
           'capacity_full',
@@ -281,6 +415,47 @@ export async function commitToSlot(
       );
     }
 
+    if (participantId !== undefined) {
+      // Scoped to the slot's signup and workspace, so a participant from
+      // anywhere else is neither written to nor given the place. A move's
+      // participant comes from its own commitment, in the same signup as the
+      // target slot, so this refuses only rows that should never exist.
+      const seen = await tx
+        .update(participants)
+        .set({ ...(data.name !== undefined ? { name: data.name } : {}), lastSeenAt: new Date() })
+        .where(
+          and(
+            eq(participants.id, participantId),
+            eq(participants.signupId, slot.signupId),
+            inWorkspace(participants.workspaceId, slot.workspaceId),
+          ),
+        )
+        .returning({ id: participants.id });
+      if (seen.length === 0) {
+        return err(serviceError('forbidden', 'participant belongs to a different signup'));
+      }
+    } else if (who.email !== undefined && data.name !== undefined) {
+      participantId = makeId('par');
+      await tx.insert(participants).values({
+        id: participantId,
+        signupId: slot.signupId,
+        workspaceId: slot.workspaceId,
+        ...participantEmailColumns(who.email),
+        name: data.name,
+      });
+      await recordActivity(tx, {
+        signupId: slot.signupId,
+        workspaceId: slot.workspaceId,
+        actor: { actorId: participantId, actorType: 'participant' },
+        eventType: 'participant.created',
+        payload: { participantId },
+      });
+    } else {
+      // Unreachable: a move brings its participant, and signing up always
+      // brings an email (null when none was given) and a name.
+      return err(serviceError('internal', 'no participant to commit'));
+    }
+
     // Position = max(position) + 1 (never reused; cancelled rows keep their position).
     const nextRows = await tx
       .select({ next: sql<number>`coalesce(max(${commitments.position}), 0) + 1` })
@@ -304,6 +479,7 @@ export async function commitToSlot(
         notes: data.notes ?? '',
         notesVisibility: 'public',
         editTokenHash: hashToken(editToken),
+        idempotencyKeyHash: keyHash,
       })
       .returning();
     if (!row) return err(serviceError('internal', 'commit insert failed'));
@@ -316,20 +492,32 @@ export async function commitToSlot(
       payload: { commitmentId, slotId },
     });
 
-    return ok({ commitment: row, editToken, signupSlug: signupRow.slug });
+    return ok({
+      commitment: toPublicCommitment(row),
+      editToken,
+      signupSlug: signupRow.slug,
+      slotAt: slot.slotAt,
+      repeated: false,
+    });
   });
 }
 
+/**
+ * A participant's own commitment, by its id and edit token, with their name
+ * and email and its signup's slug. The token is all that is checked: the edit
+ * page redirects a link whose slug is not `signupSlug` to the one that is.
+ */
 export async function getOwnCommitment(
   db: Db,
   commitmentId: string,
   token: string,
-): Promise<Result<CommitmentRow & { participantName: string; participantEmail: string }, ServiceError>> {
+): Promise<Result<OwnCommitment & { signupSlug: string }, ServiceError>> {
   const row = await db
     .select({
       c: commitments,
       pname: participants.name,
       pemail: participants.email,
+      slug: signups.slug,
     })
     .from(commitments)
     .innerJoin(participants, eq(participants.id, commitments.participantId))
@@ -345,7 +533,12 @@ export async function getOwnCommitment(
   if (!verifyHash(token, found.c.editTokenHash)) {
     return err(serviceError('forbidden', 'invalid edit token'));
   }
-  return ok({ ...found.c, participantName: found.pname, participantEmail: found.pemail });
+  return ok({
+    ...toPublicCommitment(found.c),
+    participantName: found.pname,
+    participantEmail: found.pemail,
+    signupSlug: found.slug,
+  });
 }
 
 /**
@@ -357,40 +550,44 @@ export async function getOwnCommitmentsForSignup(
   db: Db,
   signupId: string,
   items: { commitmentId: string; token: string }[],
-): Promise<Array<CommitmentRow & { participantName: string; participantEmail: string }>> {
+): Promise<PublicCommitment[]> {
   if (items.length === 0) return [];
   const tokenById = new Map(items.map((i) => [i.commitmentId, i.token]));
   const rows = await db
-    .select({
-      c: commitments,
-      pname: participants.name,
-      pemail: participants.email,
-    })
+    .select()
     .from(commitments)
-    .innerJoin(participants, eq(participants.id, commitments.participantId))
     .where(
       and(
         eq(commitments.signupId, signupId),
         inArray(commitments.id, [...tokenById.keys()]),
-        or(eq(commitments.status, 'confirmed'), eq(commitments.status, 'tentative')),
+        isActiveCommitment,
       ),
     );
-  const out: Array<CommitmentRow & { participantName: string; participantEmail: string }> = [];
+  const out: PublicCommitment[] = [];
   for (const row of rows) {
-    const token = tokenById.get(row.c.id);
+    const token = tokenById.get(row.id);
     if (!token) continue;
-    if (!verifyHash(token, row.c.editTokenHash)) continue;
-    out.push({ ...row.c, participantName: row.pname, participantEmail: row.pemail });
+    if (!verifyHash(token, row.editTokenHash)) continue;
+    out.push(toPublicCommitment(row));
   }
   return out;
 }
+
+/**
+ * The commitment as an edit left it. A move to another slot gives the new
+ * commitment, whose id and edit token are new, with `moved` holding what its
+ * edit link needs.
+ */
+type EditedCommitment = PublicCommitment & {
+  moved?: Pick<CommitResult, 'editToken' | 'signupSlug' | 'slotAt'>;
+};
 
 export async function updateOwnCommitment(
   db: Db,
   commitmentId: string,
   token: string,
   rawInput: unknown,
-): Promise<Result<CommitmentRow, ServiceError>> {
+): Promise<Result<EditedCommitment, ServiceError>> {
   const input = parseInputSafe(CommitmentUpdateInputSchema, rawInput);
   if (!input.ok) return input;
   const data: CommitmentUpdateInput = input.value;
@@ -401,6 +598,9 @@ export async function updateOwnCommitment(
 
   if (data.swapToSlotId && data.swapToSlotId !== current.slotId) {
     const swapToSlotId = data.swapToSlotId;
+    // A refusal as closed or full rolls the whole move back, so its
+    // attempt_failed row is written after, by the participant who tried.
+    let refusal: Record<string, unknown> | undefined;
     return db.transaction(async (tx) => {
       const target = await tx
         .select({ signupId: slots.signupId })
@@ -413,33 +613,50 @@ export async function updateOwnCommitment(
         return err(serviceError('forbidden', 'cannot swap to a slot in a different signup'));
       }
 
-      const cancelled = await tx
+      // The cancel locks the row, and what it returns is the commitment as it
+      // stands now: `getOwnCommitment` read before this transaction, and a
+      // quantity or notes change in another tab may have landed since.
+      const [cancelled] = await tx
         .update(commitments)
         .set({ status: 'cancelled', cancelledAt: new Date(), updatedAt: new Date() })
-        .where(
-          and(
-            eq(commitments.id, commitmentId),
-            or(eq(commitments.status, 'confirmed'), eq(commitments.status, 'tentative')),
-          ),
-        )
-        .returning({ id: commitments.id });
-      if (cancelled.length === 0) {
+        .where(and(eq(commitments.id, commitmentId), isActiveCommitment))
+        .returning({
+          id: commitments.id,
+          quantity: commitments.quantity,
+          notes: commitments.notes,
+        });
+      if (!cancelled) {
         // Nothing was mutated (the UPDATE matched no active row), so there is
         // no work to roll back. Return the error like the guards above, matching
-        // cancelOwnCommitment's handling of the same condition.
-        return err(serviceError('conflict', 'commitment is not active'));
+        // cancelOwnCommitment's handling of the same condition, with the status
+        // re-read inside the tx rather than taken from the pre-flight read.
+        // Gone altogether when its slot was deleted since then.
+        const [row] = await tx
+          .select({ status: commitments.status })
+          .from(commitments)
+          .where(eq(commitments.id, commitmentId))
+          .limit(1);
+        if (!row) return err(serviceError('not_found', 'commitment not found'));
+        return err(notActive(row.status));
       }
 
-      const newCommit = await commitToSlot(tx, swapToSlotId, {
-        name: data.name ?? current.participantName,
-        email: current.participantEmail,
-        notes: data.notes ?? current.notes,
-        quantity: data.quantity ?? current.quantity,
-      });
+      const newCommit = await commitParticipantToSlot(
+        tx,
+        swapToSlotId,
+        { participantId: current.participantId },
+        {
+          name: data.name,
+          notes: data.notes ?? cancelled.notes,
+          quantity: data.quantity ?? cancelled.quantity,
+        },
+        (payload) => {
+          refusal = payload;
+        },
+      );
       if (!newCommit.ok) {
         // Rolls back the transaction while preserving the structured error
-        // (capacity_full / closed / conflict, with its details & suggestion)
-        // rather than degrading to a generic 500.
+        // (capacity_full / closed / conflict / forbidden, with its details and
+        // suggestion) rather than degrading to a generic 500.
         throw new ServiceException(newCommit.error);
       }
 
@@ -450,7 +667,19 @@ export async function updateOwnCommitment(
         eventType: 'commitment.swapped',
         payload: { from: current.id, to: newCommit.value.commitment.id },
       });
-      return ok(newCommit.value.commitment);
+      const { commitment, editToken, signupSlug, slotAt } = newCommit.value;
+      return ok({ ...commitment, moved: { editToken, signupSlug, slotAt } });
+    }).catch(async (e: unknown) => {
+      if (refusal) {
+        await safeRecordAttemptFailed(db, {
+          signupId: current.signupId,
+          workspaceId: current.workspaceId,
+          actorId: current.participantId,
+          actorType: 'participant',
+          payload: { ...refusal, source: 'move' },
+        });
+      }
+      throw e;
     });
   }
 
@@ -494,12 +723,12 @@ export async function updateOwnCommitment(
     // `capacity_full`, and write an attempt_failed row, for a commitment
     // nobody can act on.
     if (!ACTIVE_COMMITMENT_STATUSES.includes(locked.status)) {
-      return err(serviceError('conflict', 'commitment is not active'));
+      return err(notActive(locked.status));
     }
 
     // Guards that only fire when quantity *increases* on the same slot. The
     // swap path (slotId change) returns earlier and re-runs both through
-    // commitToSlot, so a slot move never reaches here.
+    // commitParticipantToSlot, so a slot move never reaches here.
     if (data.quantity !== undefined && data.quantity > locked.quantity) {
       // The slot row goes with its commitments (the delete cascades), so with
       // the commitment found above this is only for the type.
@@ -546,17 +775,7 @@ export async function updateOwnCommitment(
 
       const cap = slotRow.capacity;
       if (cap !== null) {
-        const sumRows = await tx
-          .select({ sum: sql<number>`coalesce(sum(${commitments.quantity}), 0)::int` })
-          .from(commitments)
-          .where(
-            and(
-              eq(commitments.slotId, current.slotId),
-              ne(commitments.id, commitmentId),
-              or(eq(commitments.status, 'confirmed'), eq(commitments.status, 'tentative')),
-            ),
-          );
-        const otherQty = sumRows[0]?.sum ?? 0;
+        const otherQty = await placesTaken(tx, current.slotId, commitmentId);
         if (otherQty + data.quantity > cap) {
           const remaining = Math.max(0, cap - otherQty);
           await safeRecordAttemptFailed(tx, {
@@ -602,7 +821,7 @@ export async function updateOwnCommitment(
       .returning();
     // Unreachable while the lock above is held; kept so the write states the
     // invariant it depends on rather than inheriting it from a distant read.
-    if (!updated) return err(serviceError('conflict', 'commitment is not active'));
+    if (!updated) return err(notActive(locked.status));
 
     if (data.name && data.name !== current.participantName) {
       await tx
@@ -618,7 +837,68 @@ export async function updateOwnCommitment(
       eventType: 'commitment.updated',
       payload: { commitmentId, changed: Object.keys(data) },
     });
-    return ok(updated);
+    return ok(toPublicCommitment(updated));
+  });
+}
+
+/**
+ * Cancels one commitment under its row lock, so its places go back to the
+ * slot. The participant's own cancel (`cancelOwnCommitment`) and an
+ * organizer's removal (`removeCommitment`) both come here, and differ only in
+ * the activity row `logged` describes. The caller found the commitment and its
+ * signup live before this; both are checked again under the lock, since a
+ * slot delete (taking the commitment with it) or a signup delete can commit
+ * while this waits for it, and neither may be written to then. Cancelling one
+ * already cancelled, by a retry or a lost race, succeeds and writes nothing;
+ * `no_show`, which nothing writes yet, is a conflict.
+ *
+ * The commitment row is the only lock: a cancel gives places back, so it needs
+ * no slot lock to guard capacity, and no signup or slot lock may come after
+ * this one (src/services/locks.ts). The signup's status and `closesAt`, and
+ * the slot's, go unchecked on purpose: a closed signup or slot still takes a
+ * place back (see `updateOwnCommitment`).
+ */
+async function cancelCommitmentLocked(
+  db: Db,
+  target: { commitmentId: string; signupId: string; workspaceId: string | null },
+  logged: (
+    locked: Pick<CommitmentRow, 'participantId' | 'slotId'>,
+  ) => Pick<Parameters<typeof recordActivity>[1], 'actor' | 'eventType' | 'payload'>,
+): Promise<Result<{ cancelled: true }, ServiceError>> {
+  const { commitmentId, signupId, workspaceId } = target;
+  const thisCommitment = and(
+    eq(commitments.id, commitmentId),
+    inWorkspace(commitments.workspaceId, workspaceId),
+  );
+  return db.transaction(async (tx) => {
+    // Undefined when the slot was deleted, taking the commitment with it.
+    const [locked] = await tx
+      .select({
+        participantId: commitments.participantId,
+        slotId: commitments.slotId,
+        status: commitments.status,
+      })
+      .from(commitments)
+      .where(thisCommitment)
+      .for('update')
+      .limit(1);
+    if (!locked) return err(serviceError('not_found', 'commitment not found'));
+    if (!(await readLiveSignup(tx, signupId))) {
+      return err(serviceError('not_found', 'commitment not found'));
+    }
+    const cancelled = await tx
+      .update(commitments)
+      .set({ status: 'cancelled', cancelledAt: new Date(), updatedAt: new Date() })
+      .where(and(thisCommitment, isActiveCommitment))
+      .returning({ id: commitments.id });
+    if (cancelled.length === 0) {
+      // The lock holds the row still, so `locked.status` is current, not the
+      // caller's read from before it.
+      if (locked.status === 'cancelled') return ok({ cancelled: true });
+      return err(notActive(locked.status));
+    }
+    await recordActivity(tx, { signupId, workspaceId, ...logged(locked) });
+    return ok({ cancelled: true });
   });
 }
 
@@ -630,49 +910,51 @@ export async function cancelOwnCommitment(
   const gotten = await getOwnCommitment(db, commitmentId, token);
   if (!gotten.ok) return gotten;
   const current = gotten.value;
-
-  return db.transaction(async (tx) => {
-    // Lock the row, then check the signup is still there, as `updateOwnCommitment`
-    // does: `getOwnCommitment` read before this, and a cancel queued on the row
-    // while the signup was deleted must not write to it. Its status and
-    // `closesAt`, and the slot's, go unchecked on purpose: a cancel only gives
-    // a place back, which a closed signup or slot still takes (see
-    // `updateOwnCommitment`).
-    await tx
-      .select({ id: commitments.id })
-      .from(commitments)
-      .where(eq(commitments.id, commitmentId))
-      .for('update');
-    if (!(await readLiveSignup(tx, current.signupId))) {
-      return err(serviceError('not_found', 'commitment not found'));
-    }
-    const cancelled = await tx
-      .update(commitments)
-      .set({ status: 'cancelled', cancelledAt: new Date(), updatedAt: new Date() })
-      .where(and(eq(commitments.id, commitmentId), isActiveCommitment))
-      .returning({ id: commitments.id });
-    if (cancelled.length === 0) {
-      // Idempotent: cancelling an already-cancelled commitment (retry or lost race)
-      // is a no-op success. Reject the other terminal state, no_show, which
-      // nothing writes yet. Re-read inside the tx so we don't trust the stale
-      // pre-flight read in the concurrent case.
-      const [row] = await tx
-        .select({ status: commitments.status })
-        .from(commitments)
-        .where(eq(commitments.id, commitmentId))
-        .limit(1);
-      if (row?.status === 'cancelled') return ok({ cancelled: true });
-      return err(serviceError('conflict', 'commitment is not active'));
-    }
-    await recordActivity(tx, {
-      signupId: current.signupId,
-      workspaceId: current.workspaceId,
+  return cancelCommitmentLocked(
+    db,
+    { commitmentId, signupId: current.signupId, workspaceId: current.workspaceId },
+    () => ({
       actor: { actorId: current.participantId, actorType: 'participant' },
       eventType: 'commitment.cancelled',
       payload: { commitmentId },
-    });
-    return ok({ cancelled: true });
-  });
+    }),
+  );
+}
+
+/**
+ * An organizer takes one person off a slot (the Responses tab's Remove): the
+ * commitment is cancelled, as the participant's own cancel would, and its
+ * places go back to the slot. Editors and above; a viewer is refused by the
+ * guard. Nobody is emailed. Removing a commitment that is already cancelled
+ * succeeds and changes nothing; `no_show` is a conflict, as in
+ * `cancelOwnCommitment`.
+ */
+export async function removeCommitment(
+  db: Db,
+  actor: Actor,
+  commitmentId: string,
+): Promise<Result<{ cancelled: true }, ServiceError>> {
+  // Which signup, and so which workspace, to judge the actor against. Read
+  // unscoped, as `deleteSlot` reads its slot, and judged straight after.
+  const [found] = await db
+    .select({ signupId: commitments.signupId })
+    .from(commitments)
+    .where(eq(commitments.id, commitmentId))
+    .limit(1);
+  if (!found) return err(serviceError('not_found', 'commitment not found'));
+  const signup = await readLiveSignup(db, found.signupId);
+  if (!signup) return err(serviceError('not_found', 'commitment not found'));
+  requireWorkspaceWrite(actor, signup.workspaceId);
+
+  return cancelCommitmentLocked(
+    db,
+    { commitmentId, signupId: found.signupId, workspaceId: signup.workspaceId },
+    (locked) => ({
+      actor: activityActor(actor),
+      eventType: 'commitment.removed',
+      payload: { commitmentId, participantId: locked.participantId, slotId: locked.slotId },
+    }),
+  );
 }
 
 export async function listCommitmentsForSignup(db: Db, signupId: string) {
@@ -694,11 +976,50 @@ export async function listCommitmentsForSignup(db: Db, signupId: string) {
     .orderBy(asc(commitments.createdAt));
 }
 
-export async function countCommitmentsForSignup(db: Db, signupId: string): Promise<number> {
+/**
+ * How each of a signup's cancelled commitments came to be cancelled, when it
+ * was not the participant's own cancel: `removed` by an organizer
+ * (`removeCommitment`'s `commitment.removed` row), or `moved`, the old one of a
+ * move to another slot (the `from` of a `commitment.swapped` row). Keyed by
+ * commitment id, from one read of the signup's activity, for the Responses
+ * tab's Status. Guard-free, like `listCommitmentsForSignup`: call it only for
+ * a signup already checked.
+ */
+export async function howCommitmentsEnded(
+  db: Db,
+  signup: { id: string; workspaceId: string | null },
+): Promise<Map<string, 'removed' | 'moved'>> {
+  const commitmentId = sql<string | null>`case when ${activity.eventType} = 'commitment.removed'
+    then ${activity.payload}->>'commitmentId' else ${activity.payload}->>'from' end`;
+  const rows = await db
+    .select({ eventType: activity.eventType, commitmentId })
+    .from(activity)
+    .where(
+      and(
+        eq(activity.signupId, signup.id),
+        inWorkspace(activity.workspaceId, signup.workspaceId),
+        inArray(activity.eventType, ['commitment.removed', 'commitment.swapped']),
+      ),
+    );
+  const out = new Map<string, 'removed' | 'moved'>();
+  for (const r of rows) {
+    if (!r.commitmentId) continue;
+    out.set(r.commitmentId, r.eventType === 'commitment.removed' ? 'removed' : 'moved');
+  }
+  return out;
+}
+
+/**
+ * How many sign-ups a signup has that are still active, for the count on its
+ * Responses tab. A cancelled one, whether the participant cancelled, moved or
+ * was removed, stays in the tab's table but no longer counts. Guard-free, like
+ * `listCommitmentsForSignup`: call it only for a signup already checked.
+ */
+export async function countActiveCommitmentsForSignup(db: Db, signupId: string): Promise<number> {
   const rows = await db
     .select({ count: sql<number>`count(*)::int` })
     .from(commitments)
-    .where(eq(commitments.signupId, signupId));
+    .where(and(eq(commitments.signupId, signupId), isActiveCommitment));
   return rows[0]?.count ?? 0;
 }
 
@@ -720,16 +1041,32 @@ export async function committedBySlot(db: Db, signupId: string): Promise<Record<
       sum: sql<number>`coalesce(sum(${commitments.quantity}), 0)::int`,
     })
     .from(commitments)
-    .where(
-      and(
-        eq(commitments.signupId, signupId),
-        or(eq(commitments.status, 'confirmed'), eq(commitments.status, 'tentative')),
-      ),
-    )
+    .where(and(eq(commitments.signupId, signupId), holdsPlace))
     .groupBy(commitments.slotId);
   const out: Record<string, number> = {};
   for (const r of rows) out[r.slotId] = r.sum;
   return out;
+}
+
+/**
+ * A slot and its signup in one read, with what `whyNotTakingPlaces` asks. A
+ * join rather than `readLiveSignup`, so it checks deleted_at itself.
+ */
+async function readSlotAndSignup(db: Db, slotId: string) {
+  const [row] = await db
+    .select({
+      signupId: slots.signupId,
+      values: slots.values,
+      capacity: slots.capacity,
+      status: slots.status,
+      slotAt: slots.slotAt,
+      signup: { status: signups.status, closesAt: signups.closesAt, settings: signups.settings },
+    })
+    .from(slots)
+    .innerJoin(signups, and(eq(signups.id, slots.signupId), isNull(signups.deletedAt)))
+    .where(eq(slots.id, slotId))
+    .limit(1);
+  return row;
 }
 
 /**
@@ -742,7 +1079,9 @@ export async function committedBySlot(db: Db, signupId: string): Promise<Record<
  * tentative commitment holds, the sum that guard checks an increase against
  * (waitlisted places don't count against capacity), or `null` when the slot is
  * unlimited. The edit page leaves the quantity field out when it is 1, since 1
- * is then the only value it accepts, and says so when `closed`.
+ * is then the only value it accepts, and says so when `closed`. `slotName` is
+ * the slot's values in a line, as `cancelledCommitmentState` gives it, for the
+ * page to say which slot this is, or '' when it has none to show.
  *
  * Guard-free, like `committedBySlot`: call it only with a commitment that
  * `getOwnCommitment` has already verified against its edit token.
@@ -750,21 +1089,10 @@ export async function committedBySlot(db: Db, signupId: string): Promise<Record<
 export async function editLimitsForCommitment(
   db: Db,
   commitment: { id: string; slotId: string },
-): Promise<{ maxQuantity: number | null; closed: boolean }> {
-  // The slot and its signup in one read. A join rather than `readLiveSignup`,
-  // so it checks deleted_at itself.
-  const [row] = await db
-    .select({
-      capacity: slots.capacity,
-      status: slots.status,
-      slotAt: slots.slotAt,
-      signup: { status: signups.status, closesAt: signups.closesAt, settings: signups.settings },
-    })
-    .from(slots)
-    .innerJoin(signups, and(eq(signups.id, slots.signupId), isNull(signups.deletedAt)))
-    .where(eq(slots.id, commitment.slotId))
-    .limit(1);
-  if (!row) return { maxQuantity: null, closed: false };
+): Promise<{ maxQuantity: number | null; closed: boolean; slotName: string }> {
+  const row = await readSlotAndSignup(db, commitment.slotId);
+  if (!row) return { maxQuantity: null, closed: false, slotName: '' };
+  const slotName = summarizeSlotValues(await listFieldsForSignup(db, row.signupId), row.values);
 
   if (whyNotTakingPlaces(row.signup, row)) {
     // Read here rather than taken from the caller, whose copy may be older.
@@ -773,19 +1101,132 @@ export async function editLimitsForCommitment(
       .from(commitments)
       .where(eq(commitments.id, commitment.id))
       .limit(1);
-    return { maxQuantity: own?.quantity ?? 0, closed: true };
+    return { maxQuantity: own?.quantity ?? 0, closed: true, slotName };
   }
 
-  if (row.capacity === null) return { maxQuantity: null, closed: false };
-  const sumRows = await db
-    .select({ sum: sql<number>`coalesce(sum(${commitments.quantity}), 0)::int` })
-    .from(commitments)
+  if (row.capacity === null) return { maxQuantity: null, closed: false, slotName };
+  const others = await placesTaken(db, commitment.slotId, commitment.id);
+  return {
+    maxQuantity: Math.max(0, row.capacity - others),
+    closed: false,
+    slotName,
+  };
+}
+
+/** How many moves `cancelledCommitmentState` follows before it stops looking. */
+const MAX_MOVES_FOLLOWED = 10;
+
+/**
+ * What became of a cancelled commitment, for its edit page. A move to another
+ * slot (the swap in `updateOwnCommitment`) cancels the commitment and signs up
+ * again as a new one, with its own edit link, writing a `commitment.swapped`
+ * row `{ from, to }`. So `movedTo` is the commitment this one moved to,
+ * followed through any later moves (up to `MAX_MOVES_FOLLOWED`), while that
+ * one is still active. Otherwise `movedTo` is null, and `removed` says whether
+ * an organizer took the last one off its slot (`removeCommitment`, which
+ * writes a `commitment.removed` row `{ commitmentId }`), so the page says who
+ * did it. When they did not, `slot` says whether the slot last held would take
+ * a sign-up again (`CancelledSlotState`), so the page suggests signing up
+ * again only when that would not be refused, and otherwise says why. Either
+ * way, `slotName` is the slot last held's values in a line, as the
+ * confirmation email's subject names it, or '' when it has none to show.
+ *
+ * Guard-free, like `editLimitsForCommitment`: call it only with a commitment
+ * that `getOwnCommitment` has already verified against its edit token. Each
+ * read is scoped to its signup, which a move never leaves.
+ */
+export async function cancelledCommitmentState(
+  db: Db,
+  commitment: { id: string; signupId: string; slotId: string },
+): Promise<
+  | { movedTo: string }
+  | { movedTo: null; removed: true; slotName: string }
+  | { movedTo: null; removed: false; slot: CancelledSlotState; slotName: string }
+> {
+  let lastId = commitment.id;
+  for (let moves = 0; moves < MAX_MOVES_FOLLOWED; moves++) {
+    const [move] = await db
+      .select({ to: sql<string | null>`${activity.payload}->>'to'` })
+      .from(activity)
+      .where(
+        and(
+          eq(activity.eventType, 'commitment.swapped'),
+          eq(activity.signupId, commitment.signupId),
+          sql`(${activity.payload}->>'from') = ${lastId}`,
+        ),
+      )
+      .limit(1);
+    if (!move?.to) break;
+    lastId = move.to;
+  }
+
+  let slotId = commitment.slotId;
+  if (lastId !== commitment.id) {
+    const [last] = await db
+      .select({ status: commitments.status, slotId: commitments.slotId })
+      .from(commitments)
+      .where(and(eq(commitments.id, lastId), eq(commitments.signupId, commitment.signupId)))
+      .limit(1);
+    if (last && ACTIVE_COMMITMENT_STATUSES.includes(last.status)) return { movedTo: lastId };
+    // Moved, then cancelled too: it reads as a cancel, of the slot moved to.
+    if (last) slotId = last.slotId;
+  }
+
+  // Only an active commitment can be removed, so after any moves only the
+  // last one can have been.
+  const [removed] = await db
+    .select({ id: activity.id })
+    .from(activity)
     .where(
       and(
-        eq(commitments.slotId, commitment.slotId),
-        ne(commitments.id, commitment.id),
-        or(eq(commitments.status, 'confirmed'), eq(commitments.status, 'tentative')),
+        eq(activity.eventType, 'commitment.removed'),
+        eq(activity.signupId, commitment.signupId),
+        sql`(${activity.payload}->>'commitmentId') = ${lastId}`,
       ),
-    );
-  return { maxQuantity: Math.max(0, row.capacity - (sumRows[0]?.sum ?? 0)), closed: false };
+    )
+    .limit(1);
+  const name = await slotName(db, commitment.signupId, slotId);
+  if (removed) return { movedTo: null, removed: true, slotName: name };
+  return {
+    movedTo: null,
+    removed: false,
+    slot: await slotStateAfterCancel(db, slotId),
+    slotName: name,
+  };
+}
+
+/** `Pack away · Sat, Nov 14`: the slot's values in field order, or ''. */
+async function slotName(db: Db, signupId: string, slotId: string): Promise<string> {
+  const [slot] = await db
+    .select({ values: slots.values })
+    .from(slots)
+    .where(and(eq(slots.id, slotId), eq(slots.signupId, signupId)))
+    .limit(1);
+  if (!slot) return '';
+  const fields = await listFieldsForSignup(db, signupId);
+  return summarizeSlotValues(fields, slot.values);
+}
+
+/**
+ * Whether a slot would take a cancelled sign-up back, and if not, why:
+ * `signupClosed` when the signup takes no more places (closed, archived or
+ * past `closesAt`), `slotClosed` when only the slot does not (it is closed, or
+ * inside its lockout), `full` when every place in it is taken. `open` when a
+ * sign-up for 1 would not be refused.
+ */
+export type CancelledSlotState = 'open' | 'full' | 'slotClosed' | 'signupClosed';
+
+async function slotStateAfterCancel(db: Db, slotId: string): Promise<CancelledSlotState> {
+  const row = await readSlotAndSignup(db, slotId);
+  // Its signup was deleted since the edit link was checked.
+  if (!row) return 'signupClosed';
+  if (whyNotTakingPlaces(row.signup, row)) {
+    // A slot closed in a signup that is closed too reads as the signup
+    // closed, which says more: the same rules, with the slot's own left out.
+    const signupShut = whyNotTakingPlaces(row.signup, { status: 'open', slotAt: null });
+    return signupShut ? 'signupClosed' : 'slotClosed';
+  }
+  if (row.capacity === null) return 'open';
+  // What `commitToSlot` checks a sign-up against.
+  return (await placesTaken(db, slotId)) >= row.capacity ? 'full' : 'open';
 }

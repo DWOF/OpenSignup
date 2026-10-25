@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { getDb, type Db } from '@/db/client';
 import { activity } from '@/db/schema/activity';
 import { workspaceMembers } from '@/db/schema/members';
@@ -11,8 +11,10 @@ import { makeId } from '@/lib/ids';
 import type { Actor, WorkspaceRole } from '@/lib/policy';
 import { DEFAULT_TEMPLATE, EMPTY_TEMPLATE, type SignupTemplate } from '@/lib/signup-templates';
 import { listFieldsForSignup } from '@/services/slot-fields';
-import { addSlot } from '@/services/slots';
+import { addSlot, deleteSlot } from '@/services/slots';
+import { settle, untilServiceBlockedOn, whileSigningUp } from '@/services/testing/locks';
 import { commitToSlot } from '@/services/commitments';
+import { getSignupRowForOrganizer } from '@/services/locks';
 import {
   archiveSignup,
   closeSignup,
@@ -20,7 +22,6 @@ import {
   deleteSignup,
   getPublicSignup,
   getSignupForOrganizer,
-  getSignupRowForOrganizer,
   listSignupsForWorkspace,
   publishSignup,
   updateSignup,
@@ -522,6 +523,18 @@ describe('signups service (db)', () => {
       expect(acts.some((a) => a.eventType === 'signup.updated')).toBe(true);
     });
 
+    it('refuses a visibility change, which nothing reads', async () => {
+      const created = await createSignup(fx.db, fx.actor, fx.workspaceId, validCreateInput('Before'));
+      if (!created.ok) throw new Error('setup failed');
+
+      const r = await updateSignup(fx.db, fx.actor, created.value.id, { visibility: 'password' });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error).toMatchObject({ code: 'invalid_input', field: 'visibility' });
+      const [stored] = await fx.db.select().from(signups).where(eq(signups.id, created.value.id));
+      expect(stored?.visibility).toBe('unlisted');
+    });
+
     it('returns not_found for a missing signup', async () => {
       const r = await updateSignup(fx.db, fx.actor, makeId('sig'), { title: 'No' });
       expect(r.ok).toBe(false);
@@ -548,6 +561,17 @@ describe('signups service (db)', () => {
       expect(r.ok).toBe(false);
       if (r.ok) return;
       expect(r.error.code).toBe('invalid_input');
+    });
+
+    it('refuses a creation whose groupByFieldRefs names no template field (#516)', async () => {
+      const r = await createSignup(fx.db, fx.actor, fx.workspaceId, {
+        ...validCreateInput('Bad group'),
+        settings: { groupByFieldRefs: ['ghost'] },
+      });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error.code).toBe('invalid_input');
+      expect(r.error.field).toBe('settings.groupByFieldRefs');
     });
 
     it('keeps reminderFromFieldRef when a settings update omits it', async () => {
@@ -667,6 +691,37 @@ describe('signups service (db)', () => {
         expect(r.error.code).toBe('invalid_input');
       }
     });
+
+    it('refuses a groupByFieldRefs entry that names no field (#516)', async () => {
+      const created = await createSignup(fx.db, fx.actor, fx.workspaceId, validCreateInput('Bad group ref'));
+      if (!created.ok) throw new Error('setup failed');
+
+      const r = await updateSignup(fx.db, fx.actor, created.value.id, {
+        settings: { groupByFieldRefs: ['nope'] },
+      });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error.code).toBe('invalid_input');
+      expect(r.error.field).toBe('settings.groupByFieldRefs');
+      const [row] = await fx.db.select().from(signups).where(eq(signups.id, created.value.id));
+      expect(row?.settings).toEqual(created.value.settings);
+    });
+
+    it('saves an unrelated setting on a row that already holds a stale group-by ref', async () => {
+      // Rows saved before #516 can hold a ref that names no field. Only a save
+      // that sends groupByFieldRefs is checked, so they stay editable.
+      const created = await createSignup(fx.db, fx.actor, fx.workspaceId, validCreateInput('Stale group ref'));
+      if (!created.ok) throw new Error('setup failed');
+      await fx.db
+        .update(signups)
+        .set({ settings: { ...(created.value.settings as Record<string, unknown>), groupByFieldRefs: ['gone'] } })
+        .where(eq(signups.id, created.value.id));
+
+      const r = await updateSignup(fx.db, fx.actor, created.value.id, { settings: { sendReminders: false } });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      if (!r.ok) return;
+      expect(r.value.settings).toMatchObject({ sendReminders: false, groupByFieldRefs: ['gone'] });
+    });
   });
 
   describe('status transitions', () => {
@@ -676,6 +731,14 @@ describe('signups service (db)', () => {
         capacity: 1,
       });
       if (!r.ok) throw new Error(`slot setup failed: ${r.error.message}`);
+    }
+
+    async function refusedPublishes(signupId: string) {
+      const rows = await fx.db
+        .select({ payload: activity.payload })
+        .from(activity)
+        .where(and(eq(activity.signupId, signupId), eq(activity.eventType, 'signup.publish_refused')));
+      return rows.map((r) => r.payload);
     }
 
     it('publishSignup moves draft → open and stamps opensAt', async () => {
@@ -705,6 +768,9 @@ describe('signups service (db)', () => {
       if (r.ok) return;
       expect(r.error.code).toBe('conflict');
       expect(r.error.message).toMatch(/at least one slot/);
+      expect(await refusedPublishes(created.value.id)).toEqual([
+        { code: 'conflict', reason: 'no_slots' },
+      ]);
     });
 
     it('publishSignup rejects when not in draft', async () => {
@@ -720,6 +786,31 @@ describe('signups service (db)', () => {
       expect(r.error.code).toBe('conflict');
       expect(r.error.received).toBe('open');
       expect(r.error.expected).toBe('draft');
+      // Already open: a second click, not a publish anyone was refused.
+      expect(await refusedPublishes(created.value.id)).toEqual([]);
+    });
+
+    it('records a publish refused because the signup was closed meanwhile', async () => {
+      const created = await createSignup(fx.db, fx.actor, fx.workspaceId, validCreateInput('Stale'));
+      if (!created.ok) throw new Error('setup failed');
+      await withSlot(created.value.id);
+      if (!(await publishSignup(fx.db, fx.actor, created.value.id)).ok) throw new Error('setup failed');
+      if (!(await closeSignup(fx.db, fx.actor, created.value.id)).ok) throw new Error('setup failed');
+
+      const r = await publishSignup(fx.db, fx.actor, created.value.id);
+      expect(r.ok).toBe(false);
+      expect(await refusedPublishes(created.value.id)).toEqual([
+        { code: 'conflict', reason: 'not_draft', status: 'closed' },
+      ]);
+    });
+
+    it('records no refused publish for a publish that worked, or a refused close', async () => {
+      const created = await createSignup(fx.db, fx.actor, fx.workspaceId, validCreateInput('Fine'));
+      if (!created.ok) throw new Error('setup failed');
+      await withSlot(created.value.id);
+      expect((await closeSignup(fx.db, fx.actor, created.value.id)).ok).toBe(false);
+      expect((await publishSignup(fx.db, fx.actor, created.value.id)).ok).toBe(true);
+      expect(await refusedPublishes(created.value.id)).toEqual([]);
     });
 
     it('closeSignup moves open → closed', async () => {
@@ -754,6 +845,103 @@ describe('signups service (db)', () => {
       expect(r.ok).toBe(true);
       if (!r.ok) return;
       expect(r.value.status).toBe('archived');
+    });
+
+    async function draftWithOneSlot(title: string): Promise<{ signupId: string; slotId: string }> {
+      const created = await createSignup(fx.db, fx.actor, fx.workspaceId, validCreateInput(title), {
+        template: EMPTY_TEMPLATE,
+      });
+      if (!created.ok) throw new Error('setup failed');
+      const slot = await addSlot(fx.db, fx.actor, created.value.id, { values: {}, capacity: 1 });
+      if (!slot.ok) throw new Error(`slot setup failed: ${slot.error.message}`);
+      return { signupId: created.value.id, slotId: slot.value.id };
+    }
+
+    async function statusOf(signupId: string) {
+      const [row] = await fx.db.select().from(signups).where(eq(signups.id, signupId));
+      return row?.status;
+    }
+
+    it('an archive racing a publish ends as one of the two serial orders, never open', async () => {
+      for (let i = 0; i < 10; i++) {
+        const { signupId } = await draftWithOneSlot(`Archive vs publish ${i}`);
+        const [archived, published] = await Promise.all([
+          archiveSignup(fx.db, fx.actor, signupId),
+          publishSignup(fx.db, fx.actor, signupId),
+        ]);
+        expect(archived.ok).toBe(true);
+        // Publish first, then archive: both succeed. Archive first: the
+        // publish finds an archived signup and is refused.
+        if (!published.ok) expect(published.error.code).toBe('conflict');
+        expect(await statusOf(signupId)).toBe('archived');
+      }
+    });
+
+    it('a publish waiting on an archive sees the archived status and is refused', async () => {
+      const { signupId } = await draftWithOneSlot('Publish behind archive');
+      let publishing: ReturnType<typeof publishSignup> | undefined;
+      const held = fx.db.transaction(async (tx) => {
+        const archived = await archiveSignup(tx as unknown as Db, fx.actor, signupId);
+        expect(archived.ok, JSON.stringify(archived)).toBe(true);
+        publishing = publishSignup(fx.db, fx.actor, signupId);
+        await untilServiceBlockedOn(fx.db, tx, publishing);
+      });
+      await held.finally(() => settle(publishing));
+
+      const r = await publishing!;
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe('conflict');
+        expect(r.error.received).toBe('archived');
+      }
+      expect(await statusOf(signupId)).toBe('archived');
+    });
+
+    it('two closes at once: one succeeds, one conflicts, one signup.closed row', async () => {
+      const { signupId } = await draftWithOneSlot('Double close');
+      const pub = await publishSignup(fx.db, fx.actor, signupId);
+      if (!pub.ok) throw new Error('setup failed');
+
+      const results = await Promise.all([
+        closeSignup(fx.db, fx.actor, signupId),
+        closeSignup(fx.db, fx.actor, signupId),
+      ]);
+      expect(results.filter((r) => r.ok)).toHaveLength(1);
+      const refused = results.find((r) => !r.ok);
+      expect(refused && !refused.ok && refused.error.code).toBe('conflict');
+
+      const acts = await fx.db.select().from(activity).where(eq(activity.signupId, signupId));
+      expect(acts.filter((a) => a.eventType === 'signup.closed')).toHaveLength(1);
+    });
+
+    it('a publish waiting on the delete of the last slot is refused', async () => {
+      const { signupId, slotId } = await draftWithOneSlot('Publish behind slot delete');
+      let publishing: ReturnType<typeof publishSignup> | undefined;
+      // deleteSlot holds the slot row, not the signup's, so only the slot
+      // lock can make the publish wait for it.
+      const held = fx.db.transaction(async (tx) => {
+        const deleted = await deleteSlot(tx as unknown as Db, fx.actor, slotId, { force: true });
+        expect(deleted.ok, JSON.stringify(deleted)).toBe(true);
+        publishing = publishSignup(fx.db, fx.actor, signupId);
+        await untilServiceBlockedOn(fx.db, tx, publishing);
+      });
+      await held.finally(() => settle(publishing));
+
+      const r = await publishing!;
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe('conflict');
+        expect(r.error.message).toMatch(/at least one slot/);
+      }
+      expect(await statusOf(signupId)).toBe('draft');
+    });
+
+    it('a publish does not deadlock with someone part-way through signing up', async () => {
+      const { signupId, slotId } = await draftWithOneSlot('Publish during sign-up');
+      const r = await whileSigningUp(fx.db, { signupId, workspaceId: fx.workspaceId, slotId }, () =>
+        publishSignup(fx.db, fx.actor, signupId),
+      );
+      expect(r.ok, JSON.stringify(r)).toBe(true);
     });
   });
 

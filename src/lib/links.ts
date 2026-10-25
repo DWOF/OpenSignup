@@ -34,9 +34,35 @@ export function commitmentEditUrl(slug: string, commitmentId: string, token: str
   return absoluteUrl(`/s/${slug}/c/${commitmentId}?token=${token}`);
 }
 
+/**
+ * A new commitment's edit page URL and its `_links`, as signing up and moving a
+ * sign-up both return them. `self` and `cancel` stay relative, like the rest of
+ * the API's links.
+ */
+export function commitmentLinks(
+  slug: string,
+  commitmentId: string,
+  token: string,
+): {
+  editUrl: string;
+  links: { edit: LinkObject; self: LinkObject; cancel: LinkObject };
+} {
+  const editUrl = commitmentEditUrl(slug, commitmentId, token);
+  const self = `/api/commitments/${commitmentId}?token=${token}`;
+  return {
+    editUrl,
+    links: { edit: link(editUrl), self: link(self), cancel: link(self, 'DELETE') },
+  };
+}
+
+/** The reminder opt-out confirm page's path, which the email links to and the redirects send people back to. */
+export function unsubscribePath(slug: string, participantId: string, token: string): string {
+  return `/s/${slug}/unsubscribe?p=${encodeURIComponent(participantId)}&token=${encodeURIComponent(token)}`;
+}
+
 /** Human-visible link: lands on a confirm page, opts out only on submit. */
 export function reminderUnsubscribeUrl(slug: string, participantId: string, token: string): string {
-  return absoluteUrl(`/s/${slug}/unsubscribe?p=${participantId}&token=${token}`);
+  return absoluteUrl(unsubscribePath(slug, participantId, token));
 }
 
 /**

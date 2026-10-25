@@ -1,14 +1,27 @@
 'use client';
 
+import { useEffect, useId, useRef } from 'react';
 import { Check, Copy, Hash, Trash2 } from 'lucide-react';
-import { MIN_DATE_YEAR } from '@/schemas/slot-fields';
-import { FIELD_TYPE_META } from '../build-shared/fieldTypes';
+import { FIELD_TYPE_META, FIELD_VALUE_INPUT_CLASS, FIELD_VALUE_INPUTS } from '../build-shared/fieldTypes';
+import { InlineNote } from '@/components/ui/inline-note';
 import { EnumPicker } from './EnumPicker';
 import type { BuildField, BuildRow } from '../build-shared/useBuildState';
 
 type SlotEditorProps = {
   row: BuildRow;
   fields: BuildField[];
+  /** Focus the first field's control when the editor opens. */
+  focusOnOpen?: boolean;
+  /** Called once the editor has taken focus, so the request can be cleared. */
+  onFocused?: () => void;
+  /** Spots taken on this slot when the page loaded (`committedBySlot`). */
+  taken: number;
+  /**
+   * Whether the people holding this slot are emailed when its date or time
+   * changes: the signup sends reminders. The change email follows the same
+   * switch (src/jobs/slot-changes.ts).
+   */
+  remindersOn: boolean;
   onCellChange: (fieldRef: string, value: string) => void;
   onCapacity: (capacity: number | null) => void;
   /**
@@ -22,33 +35,18 @@ type SlotEditorProps = {
   onClose: () => void;
 };
 
-const TYPE_PLACEHOLDERS: Record<string, string> = {
-  text: 'e.g. Bring napkins',
-  date: 'YYYY-MM-DD',
-  time: 'e.g. 09:00',
-  number: 'e.g. 12',
-  enum: 'Pick from list',
-};
-
-const TYPE_INPUT_ATTRS: Record<
-  string,
-  { type?: string; min?: string; inputMode?: React.HTMLAttributes<HTMLInputElement>['inputMode'] }
-> = {
-  text: { type: 'text' },
-  // The picker starts where the services do; they refuse an earlier date.
-  date: { type: 'date', min: `${MIN_DATE_YEAR}-01-01` },
-  time: { type: 'time' },
-  number: { type: 'number', inputMode: 'numeric' },
-};
-
 /**
  * Inline accordion editor for a single slot. Auto-fit grid keeps small
- * schemas tight while letting wider schemas wrap naturally; capacity rides
+ * schemas tight while letting wider schemas wrap naturally; spots ride
  * along as the trailing cell so it lives in the same visual band.
  */
 export function SlotEditor({
   row,
   fields,
+  focusOnOpen = false,
+  onFocused,
+  taken,
+  remindersOn,
   onCellChange,
   onCapacity,
   onAddEnumOption,
@@ -56,6 +54,14 @@ export function SlotEditor({
   onDelete,
   onClose,
 }: SlotEditorProps) {
+  const gridRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!focusOnOpen) return;
+    gridRef.current?.querySelector<HTMLElement>('input, button')?.focus();
+    onFocused?.();
+  }, [focusOnOpen, onFocused]);
+
+  const spotsHelpId = useId();
   return (
     <div className="px-3.5 pb-3.5 pt-3" data-testid={`slot-editor-${row.id}`}>
       <div className="mb-2.5 flex items-center justify-between">
@@ -89,7 +95,15 @@ export function SlotEditor({
           </button>
         </div>
       </div>
-      <div className="grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-2.5">
+      {taken > 0 && (
+        <InlineNote className="mb-2.5">
+          {signedUpLine(taken)}{' '}
+          {remindersOn
+            ? 'If you change its date or time, we\u2019ll email them to let them know.'
+            : 'Reminders are off, so we won\u2019t email them if you change it.'}
+        </InlineNote>
+      )}
+      <div ref={gridRef} className="grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-2.5">
         {fields.map((f) => {
           const fieldType = f.config.fieldType;
           const TypeIcon = FIELD_TYPE_META[fieldType].icon;
@@ -119,11 +133,11 @@ export function SlotEditor({
                 />
               ) : (
                 <input
-                  {...(TYPE_INPUT_ATTRS[fieldType] ?? { type: 'text' })}
+                  {...FIELD_VALUE_INPUTS[f.config.fieldType]}
+                  {...(f.config.fieldType === 'text' ? { maxLength: f.config.maxLength } : {})}
                   value={row.values[f.ref] ?? ''}
-                  placeholder={TYPE_PLACEHOLDERS[fieldType] ?? ''}
                   onChange={(e) => onCellChange(f.ref, e.target.value)}
-                  className="rounded-md border border-surface-sunk bg-white px-2.5 py-1.5 text-[13px] text-ink outline-none focus:border-brand"
+                  className={FIELD_VALUE_INPUT_CLASS}
                   aria-label={`${f.name} value`}
                 />
               )}
@@ -133,13 +147,13 @@ export function SlotEditor({
         <label className="flex flex-col gap-1 text-[11px] text-ink-muted">
           <span className="inline-flex items-center gap-1">
             <Hash size={10} className="text-ink-soft" />
-            Capacity
+            Spots
           </span>
           <input
             type="number"
             min={1}
             value={row.capacity ?? ''}
-            placeholder={'\u221e'}
+            placeholder="No limit"
             onChange={(e) => {
               const raw = e.target.value;
               if (raw === '') {
@@ -149,11 +163,21 @@ export function SlotEditor({
               const parsed = parseInt(raw, 10);
               onCapacity(Math.max(1, Number.isFinite(parsed) ? parsed : 1));
             }}
-            aria-label="Capacity"
+            aria-label="Spots"
+            aria-describedby={spotsHelpId}
             className="w-20 rounded-md border border-surface-sunk bg-white px-2.5 py-1.5 text-[13px] text-ink outline-none focus:border-brand"
           />
+          <span id={spotsHelpId} className="text-[11px] text-ink-soft">
+            How many places people can take. Leave blank for no limit.
+          </span>
         </label>
       </div>
     </div>
   );
+}
+
+function signedUpLine(taken: number): string {
+  return taken === 1
+    ? '1 person is signed up for this slot.'
+    : `${taken} people are signed up for this slot.`;
 }

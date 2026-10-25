@@ -8,6 +8,7 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { UI } from '@/help/articles/create-and-publish-a-signup.ui';
 import { loginAsSeededOrganizer } from '../helpers/auth';
+import { createPublishedSignup } from '../helpers/signups';
 
 const SLUG = 'create-and-publish-a-signup';
 const CAPTURE = process.env.HELP_SCREENSHOTS === '1';
@@ -66,7 +67,7 @@ test.describe('help: create and publish your first signup', () => {
     await expect(slotEditor.getByText(UI.date, { exact: true })).toBeVisible();
     await slotEditor.getByRole('textbox', { name: `${UI.what} value` }).fill('Fruit and water');
     await slotEditor.getByLabel(`${UI.date} value`).fill('2030-04-06');
-    await slotEditor.getByRole('spinbutton', { name: UI.capacity }).fill('2');
+    await slotEditor.getByRole('spinbutton', { name: UI.spots }).fill('2');
     await expect(page.getByText('Saved', { exact: true })).toBeVisible();
     await shot(page, slotEditor, 'slot');
     await slotEditor.getByRole('button', { name: UI.done }).click();
@@ -84,16 +85,30 @@ test.describe('help: create and publish your first signup', () => {
     await withEmpty.close();
 
     await page.getByRole('button', { name: /Fruit and water/ }).click();
+    const original = await slotEditor.getAttribute('data-testid');
     await slotEditor.getByRole('button', { name: UI.duplicate }).click();
-    await slotEditor.getByRole('button', { name: UI.done }).click();
-    await expect(page.getByRole('button', { name: /^Edit slot/ })).toHaveCount(3);
-    // "Then open the copy and change its date." The copy lands last.
-    await page
-      .getByRole('button', { name: /Fruit and water/ })
-      .last()
-      .click();
+    // "The copy opens below it": the original closes and the copy's editor
+    // opens in its place, directly under the original's row, with focus in it.
+    await expect(slotEditor).not.toHaveAttribute('data-testid', original!);
+    await expect(slotEditor.getByRole('textbox', { name: `${UI.what} value` })).toBeFocused();
+    await expect(page.getByRole('button', { name: /Fruit and water/ })).toHaveCount(1);
+    const rows = page.locator('[data-testid^="wysiwyg-slot-"]');
+    await expect(rows).toHaveCount(3);
+    await expect(rows.nth(1).locator('[data-testid^="slot-editor-"]')).toBeVisible();
+    // "ready for you to change its date"
+    // "Saved" may still be showing from the copy, so wait for the date's own save.
+    const dateSaved = page.waitForResponse(
+      (res) => res.request().method() === 'PATCH' && res.url().includes('/api/slots/') && res.ok(),
+    );
     await slotEditor.getByLabel(`${UI.date} value`).fill('2030-04-13');
+    await dateSaved;
     await slotEditor.getByRole('button', { name: UI.done }).click();
+    await expect(rows.nth(0)).toContainText('Apr 6');
+    await expect(rows.nth(1)).toContainText('Apr 13');
+    // The server keeps the copy in the same place.
+    await page.reload();
+    await expect(rows.nth(0)).toContainText('Apr 6');
+    await expect(rows.nth(1)).toContainText('Apr 13');
     await page.getByText(UI.emptySlot, { exact: true }).click();
     await slotEditor.getByRole('button', { name: UI.delete }).click();
     await expect(page.getByRole('button', { name: /^Edit slot/ })).toHaveCount(2);
@@ -170,10 +185,70 @@ test.describe('help: create and publish your first signup', () => {
     await page.goto(copied);
     await expect(page.getByRole('heading', { name: 'Snack duty — Spring season' })).toBeVisible();
     await expect(page.getByText('Fruit and water')).toHaveCount(2);
-    await expect(page.getByText('0 of 2 signed up')).toHaveCount(2);
+    await expect(page.getByText('2 left', { exact: true })).toHaveCount(2);
     const signUp = page.getByRole('button', { name: new RegExp(`^${UI.signUp} for`) });
     await expect(signUp).toHaveCount(2);
     await expect(signUp.first()).toHaveText(UI.signUp);
+  });
+
+  test('people can sign up without an email', async ({ page, context, browser, isMobile }) => {
+    test.skip(isMobile, 'the same steps on a phone; the desktop run takes the picture');
+    await loginAsSeededOrganizer(context);
+    // A published signup with a slot of two spots.
+    const signup = await createPublishedSignup(page.request, {
+      title: `No email ${Date.now()}`,
+      slot: { values: { what: 'Fruit and water', date: '2030-04-06' }, capacity: 2 },
+    });
+    const signUp = new RegExp(`^${UI.signUp} for Fruit and water`);
+
+    await page.goto(`/app/signups/${signup.id}/build`);
+    await page.getByRole('tab', { name: UI.settings }).click();
+    const form = page.getByRole('region', { name: UI.signupForm });
+    const ask = form.getByRole('group', { name: UI.askForEmail });
+    // "A signup asks people for their email unless you make it optional."
+    await expect(ask.getByRole('radio', { name: UI.emailRequired })).toBeChecked();
+    await ask.getByRole('radio', { name: UI.emailOptional }).check();
+    await form.getByRole('button', { name: UI.save }).click();
+    await expect(form.getByRole('status')).toHaveText(UI.saved);
+    await expect(ask.getByRole('radio', { name: UI.emailOptional })).toBeChecked();
+    await shot(page, form, 'email-setting');
+
+    // Someone who leaves it blank sees their link on screen, and no email.
+    const blank = await browser.newPage();
+    await blank.goto(`/s/${signup.slug}`);
+    await blank.getByRole('button', { name: signUp }).click();
+    await expect(blank.getByLabel(UI.emailBoxOptional)).toHaveJSProperty('required', false);
+    await blank.getByLabel('Your name').fill('Sam Example');
+    await blank.getByRole('button', { name: 'Confirm' }).click();
+    await expect(blank.getByText(/won.t email/)).toBeVisible();
+    await expect(
+      blank.getByRole('link', { name: new RegExp(`/s/${signup.slug}/c/`) }),
+    ).toBeVisible();
+    // The same browser can still change or cancel.
+    await blank.getByRole('button', { name: 'Done' }).click();
+    await expect(
+      blank.getByRole('link', { name: /^Edit your spot for Fruit and water/ }),
+    ).toBeVisible();
+    await blank.close();
+
+    // Sam's sign-up is on the Responses tab, where a lost link's old sign-up
+    // is removed.
+    await page.getByRole('tab', { name: UI.responses }).click();
+    await expect(page.getByRole('cell', { name: 'Sam Example', exact: true })).toBeVisible();
+
+    // Back to Required: new sign-ups are asked, and Sam keeps the spot.
+    await page.goto(`/app/signups/${signup.id}/settings`);
+    await ask.getByRole('radio', { name: UI.emailRequired }).check();
+    await form.getByRole('button', { name: UI.save }).click();
+    await expect(form.getByRole('status')).toHaveText(UI.saved);
+    await expect(ask.getByRole('radio', { name: UI.emailRequired })).toBeChecked();
+    const next = await browser.newPage();
+    await next.goto(`/s/${signup.slug}`);
+    await expect(next.getByText('1 left', { exact: true })).toBeVisible();
+    await next.getByRole('button', { name: signUp }).click();
+    await expect(next.getByLabel('Email', { exact: true })).toHaveJSProperty('required', true);
+    await expect(next.getByLabel(UI.emailBoxOptional)).toHaveCount(0);
+    await next.close();
   });
 
   test.describe('on a phone', () => {
