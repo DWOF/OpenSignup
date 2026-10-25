@@ -31,6 +31,10 @@ FILES=(
   src/email/templates/reminder.tsx
   src/oauth/provider.ts
   src/components/build-wysiwyg/Editable.tsx
+  src/app/login/confirm/sign-in-link.tsx
+  "src/app/oauth/consent/[uid]/consent-form.tsx"
+  src/email/templates/slot-changed.tsx
+  src/lib/seo.ts
 )
 
 # 1. Back to upstream.
@@ -63,6 +67,11 @@ sed -i "s/>OpenSignup</>${NAME_SED}</" src/email/templates/layout.tsx
 sed -i "s/^\(\s*\)OpenSignup$/\1${NAME_SED}/" "src/app/app/(chrome)/layout.tsx"
 sed -i "s/Welcome to OpenSignup/Welcome to ${NAME_SED}/" "src/app/app/(chrome)/page.tsx"
 sed -i "s/title: 'OpenSignup'/title: '${NAME_SED}'/g" "src/app/app/(chrome)/signups/[id]/layout.tsx"
+
+# 4b. Link-preview alt text, kept in step with the image (upstream tests this).
+ALT_SED=$(sed -e 's/[&/\\]/\\&/g' easebourne/assets/opengraph-image.alt.txt | tr -d '\n')
+sed -i "s/^  alt: '.*',$/  alt: '${ALT_SED}',/" src/lib/seo.ts
+grep -q "alt: '${ALT_SED}'" src/lib/seo.ts || { echo "Alt-text patch did not apply" >&2; exit 1; }
 
 # 5. Organiser allowlist (ORGANISER_EMAILS in .env).
 sed -i '/^    callbacks: {$/r easebourne/patches/organiser-allowlist.snippet' src/auth/config.ts

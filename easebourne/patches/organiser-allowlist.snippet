@@ -9,6 +9,5 @@
         if (allowed.length === 0) return true;
         const email = (user?.email ?? '').trim().toLowerCase();
         if (allowed.includes(email)) return true;
-        log.warn({ emailDomain: extractEmailDomain(email) }, 'sign-in refused: not in ORGANISER_EMAILS');
         return false;
       },
